@@ -724,6 +724,79 @@ def run_token_control():
     print('Tokenized control PTY check passed: launch output, bounded continuation, verified holder, and zero flags.')
 
 
+def run_marketplace_discovery():
+    funding, posting = 'a' * 64, 'c' * 64
+    block_hash = lambda height: f'{1000 + height:064x}'
+    # A full V4 offer template published as the last output of a different
+    # posting transaction, without a spend of funding output 1.
+    template = (
+        struct.pack('<II', 0x80000004, 0x892f2085) + b'\x01'
+        + bytes.fromhex(funding)[::-1] + struct.pack('<I', 0)
+        + b'\x01\x51' + struct.pack('<I', 0xffffffff)
+        + b'\x01' + struct.pack('<q', 25000) + b'\x01\x52'
+        + struct.pack('<II', 0, 100) + bytes(11)
+    )
+    proof = bytes.fromhex('0500000003000101000000000100000000') + bytes([len(template)]) + template + bytes(4)
+    offer_script = (bytes([0x6a, 0x4c, len(proof)]) + proof).hex()
+    lock = dict(n=0, valueSat=50000, scriptPubKey=dict(commitmenthash=dict(currencyvalues={})))
+    fund = dict(txid=funding, blockhash=block_hash(2), height=2, time=1700000002,
+                confirmations=19, vin=[], vout=[lock, dict(n=1, valueSat=10000, scriptPubKey={})])
+    publication = dict(txid=posting, vin=[], vout=[
+        lock, dict(n=1, valueSat=0, scriptPubKey=dict(hex=offer_script, type='nulldata'))
+    ])
+    scanned = []
+
+    def block(params):
+        selector = str(params[0])
+        height = int(selector, 16) - 1000 if len(selector) == 64 else int(selector)
+        verbosity = params[1] if len(params) > 1 else 1
+        if verbosity == 2:
+            scanned.append(height)
+        transactions = [publication] if height == 10 else [fund] if height == 2 else [
+            dict(txid=f'{2000 + height:064x}', vin=[dict(coinbase='00')], vout=[])
+        ]
+        return dict(hash=block_hash(height), height=height, time=1700000000 + height,
+                    size=100, confirmations=21-height, previousblockhash=block_hash(height-1),
+                    tx=transactions if verbosity == 2 else [tx['txid'] for tx in transactions])
+
+    server = daemon(VRSC)
+    server.rpc_handlers = {
+        'getinfo': lambda _: dict(chainid=VRSC, blocks=20, longestchain=20, connections=0),
+        'getblockchaininfo': lambda _: dict(blocks=20, bestblockhash=block_hash(20)),
+        'getblockcount': lambda _: 20,
+        'getblockhash': lambda params: block_hash(int(params[0])),
+        'getblock': block,
+        'getblockheader': block,
+        'getrawtransaction': lambda params: {funding: fund, posting: publication}.get(params[0]),
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix='carbide-historical-offer-') as directory:
+            root = Path(directory)
+            conf = root / 'VRSC.conf'
+            conf.write_text(f'rpcconnect=127.0.0.1\nrpcport={server.server_port}\n')
+            terminal = Terminal(root, conf)
+            try:
+                wait(terminal, 'Recent Blocks')
+                terminal.key(b'/' + funding.encode() + b'\r')
+                wait(terminal, 'Outputs 2')
+                terminal.key(b'e')
+                wait(terminal, 'Press e to search from 10')
+                assert [height for height in scanned if height <= 10] == list(range(2, 10)), scanned
+                terminal.key(b'e')
+                wait(terminal, 'Signed offer publication found')
+                wait(terminal, 'Signed offer publication:')
+                assert [height for height in scanned if height <= 10] == list(range(2, 11)), scanned
+                terminal.key(b'\x1b[H\r')
+                wait(terminal, 'Marketplace funding output:')
+                assert_quits(terminal)
+            finally:
+                dispose(terminal)
+    finally:
+        server.shutdown()
+        server.server_close()
+    print('Historical marketplace PTY check passed: undiscovered embedded proof, bounded search, and resume.')
+
+
 if __name__ == '__main__':
     import sys
     if '--job-control' in sys.argv:
@@ -740,6 +813,8 @@ if __name__ == '__main__':
         run_dashboard()
     elif '--token-control-only' in sys.argv:
         run_token_control()
+    elif '--marketplace-discovery' in sys.argv:
+        run_marketplace_discovery()
     else:
         run_shutdown()
         run()
@@ -747,3 +822,4 @@ if __name__ == '__main__':
         run_mempool()
         run_dashboard()
         run_token_control()
+        run_marketplace_discovery()

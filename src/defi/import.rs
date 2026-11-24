@@ -133,7 +133,7 @@ async fn inspect_inner(
         "Transfer count mismatch"
     );
     trail.edges.push(LifecycleEdge {
-        source: export_ref,
+        source: export_ref.clone(),
         target: root.clone(),
         relation: "export-import".into(),
         resolution: "structural".into(),
@@ -146,6 +146,102 @@ async fn inspect_inner(
         transfers.len(),
         region.len()
     ));
+    if launch_funding::applicable(record) {
+        if export_tx.source_id == fresh.source_id
+            && let Some(verified) = (launch_funding::Evidence {
+                source: &fresh.source_id,
+                root,
+                record,
+                import_tx: tx,
+                export_tx: &export_tx.result,
+                export_vout,
+            })
+            .verify(&client)
+            .await
+        {
+            verified.links(trail, root);
+            for receipt in &verified.receipts {
+                trail.entries.push(entry(&receipt.funding, "Launch contribution",
+                    "Exact reserve-transfer outpoint consumed in the source export's ordered input range"));
+                trail.edges.push(LifecycleEdge {
+                    source: receipt.funding.clone(),
+                    target: export_ref.clone(),
+                    relation: "spent-by-export".into(),
+                    resolution: "structural".into(),
+                    detail: "Export spends this launch contribution at its matched batch position"
+                        .into(),
+                });
+                verified.add_receipt(trail, receipt);
+            }
+            if let Some(rewards) = &verified.rewards {
+                rewards.append(trail, root);
+            }
+            trail.notes.push("The launch phase links consume both the preceding import and its state. Service and reserve-maintenance outputs are separate from the verified customer receipts.".into());
+            return Ok(());
+        }
+        trail.notes.push("The launch receipts could not be verified from the available definition, export inputs, and linked launch phases.".into());
+    }
+    if import_rewards::applicable(record) {
+        if let Some(rewards) = (import_rewards::Evidence {
+            source: &source_client,
+            source_id: &export_tx.source_id,
+            destination: &client,
+            destination_id: &fresh.source_id,
+            root,
+            record,
+            import_tx: tx,
+            export_tx: &export_tx.result,
+        })
+        .verify()
+        .await
+        {
+            trail.edges.push(LifecycleEdge {
+                source: rewards.funding.clone(),
+                target: export_ref,
+                relation: "spent-by-export".into(),
+                resolution: "structural".into(),
+                detail: "Export consumes the exact verified funding outpoint".into(),
+            });
+            rewards.append(trail, root, true);
+            return Ok(());
+        }
+        trail.notes.push("Submission rewards remain unattributed for this import. Their calculation requires the original export and definition, the producer block, and the active entropy header.".into());
+    }
+    if export_tx.source_id == fresh.source_id
+        && import_rewards::exporters::settled_applicable(record, root.system_id.as_ref())
+        && let Some(verified) = (import_rewards::exporters::SettledEvidence {
+            source: &fresh.source_id,
+            root,
+            record,
+            import_tx: tx,
+            export_tx: &export_tx.result,
+            export_vout,
+        })
+        .verify(&client)
+        .await
+    {
+        for (funding, receipt) in verified.funding {
+            trail.entries.push(entry(
+                &funding,
+                "Import funding",
+                "Matched ordered reserve transfer",
+            ));
+            trail.entries.push(entry(
+                &receipt,
+                "Verified customer receipt",
+                "Exact amount and recipient script from ordered conversion replay",
+            ));
+            trail.edges.push(LifecycleEdge {
+                source: funding,
+                target: receipt,
+                relation: "import-customer-receipt".into(),
+                resolution: "attributed".into(),
+                detail: "Exact ordered reserve conversion".into(),
+            });
+        }
+        verified.rewards.append(trail, root);
+        return Ok(());
+    }
     let allocations = if transfers.is_empty() {
         let definition = client.get_currency(currency).await?;
         ensure!(

@@ -14,6 +14,7 @@ mod identity_evidence;
 mod input;
 mod job_control;
 mod json_dates;
+mod marketplace_trace;
 mod notarization_ui;
 mod peer_controls;
 mod registration_payments;
@@ -140,8 +141,7 @@ struct PreparedTransaction {
     parents: Vec<Txid>,
     currencies: Vec<String>,
     currency_names: HashMap<String, String>,
-    proof_funders: Vec<Txid>,
-    marketplace_spender: Option<Txid>,
+    marketplace_publication: Option<marketplace_trace::Offer>,
 }
 
 impl PreparedTransaction {
@@ -150,28 +150,13 @@ impl PreparedTransaction {
         collect_identity_references(raw, &mut identities);
         let mut currency_names = HashMap::new();
         collect_currency_name_hints(raw, &mut currency_names);
-        let proof_funders = if contains_marketplace_offer_proof(raw) {
-            raw["vin"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|input| input["vout"].as_u64() == Some(1))
-                .filter_map(|input| input["txid"].as_str().map(str::to_owned))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let marketplace_spender = transaction_output(raw, 0)
-            .and_then(|output| output["spentTxId"].as_str())
-            .map(str::to_owned);
         Self {
             tags: summary.tags(),
             identities,
             parents: source_transaction_ids(raw),
             currencies: defi_currency_ids(raw),
             currency_names,
-            proof_funders,
-            marketplace_spender,
+            marketplace_publication: marketplace_trace::publication(raw),
         }
     }
 }
@@ -275,7 +260,7 @@ struct ObjectStore {
     currency_name_hints: HashMap<String, String>,
     marketplace_tags_by_txid: HashMap<Txid, BTreeSet<MarketplaceTag>>,
     marketplace_proofs: HashMap<Txid, HashSet<Txid>>,
-    marketplace_spends: HashMap<Txid, HashSet<Txid>>,
+    marketplace_searches: HashMap<Txid, marketplace_trace::search::Cursor>,
     identity_offers: HashMap<String, IdentityOffersState>,
 }
 
@@ -667,6 +652,11 @@ enum ViewMode {
 #[derive(Debug)]
 enum AppEvent {
     NotarizationChanged,
+    MarketplaceSearch {
+        funding: String,
+        request: Arc<()>,
+        page: Box<marketplace_trace::search::ResultPage>,
+    },
     RegistrationPayments {
         key: registration_payments::Key,
         request: Arc<()>,
@@ -1018,15 +1008,9 @@ impl ObjectStore {
             ))
         });
         self.learn_prepared_currency_data(prepared);
-        for funding in &prepared.proof_funders {
+        if let Some(offer) = &prepared.marketplace_publication {
             self.marketplace_proofs
-                .entry(funding.clone())
-                .or_default()
-                .insert(txid.clone());
-        }
-        if let Some(spender) = &prepared.marketplace_spender {
-            self.marketplace_spends
-                .entry(spender.clone())
+                .entry(offer.funding.clone())
                 .or_default()
                 .insert(txid.clone());
         }
@@ -1255,24 +1239,57 @@ impl ObjectStore {
             .insert(tag);
     }
 
-    fn marketplace_proof_matches(&self, proof: &str, funding: &str) -> bool {
-        self.transaction(proof)
-            .and_then(|tx| tx.prepared.as_deref())
-            .is_some_and(|data| data.proof_funders.iter().any(|id| id == funding))
-            && self
-                .transaction(funding)
-                .is_some_and(|tx| marketplace_funding_shape(&tx.raw_json))
+    fn marketplace_publication(&self, proof: &str) -> Option<&marketplace_trace::Offer> {
+        let transaction = self.transaction(proof)?;
+        if marketplace_trace::orphan(&transaction.raw_json) {
+            return None;
+        }
+        transaction
+            .prepared
+            .as_deref()?
+            .marketplace_publication
+            .as_ref()
+    }
+
+    fn marketplace_contract(&self, funding: &str) -> Option<(&str, &marketplace_trace::Offer)> {
+        let transaction = self.transaction(funding)?;
+        if !marketplace_funding_shape(&transaction.raw_json)
+            || marketplace_trace::orphan(&transaction.raw_json)
+        {
+            return None;
+        }
+        let proofs = self.marketplace_proofs.get(funding)?;
+        let mut offers: Vec<_> = proofs
+            .iter()
+            .filter_map(|proof| {
+                let offer = self
+                    .marketplace_publication(proof)
+                    .filter(|offer| offer.funding == funding)?;
+                Some((proof.as_str(), offer))
+            })
+            .collect();
+        offers.sort_unstable_by_key(|(proof, offer)| (!offer.spends_publication_funds, *proof));
+        let &(proof, offer) = offers.first()?;
+        let conflict = offers
+            .iter()
+            .take_while(|(_, other)| {
+                other.spends_publication_funds == offer.spends_publication_funds
+            })
+            .any(|(_, other)| !offer.same_contract(other));
+        (!conflict).then_some((proof, offer))
+    }
+
+    fn marketplace_execution(&self, raw: &Value) -> Option<marketplace_trace::Spend> {
+        let funding = raw["vin"].get(0)?["txid"].as_str()?;
+        let (_, offer) = self.marketplace_contract(funding)?;
+        marketplace_trace::classify(offer, &self.transaction(funding)?.raw_json, raw)
     }
 
     fn marketplace_offer(&self, txid: &str) -> bool {
         self.marketplace_tags_by_txid
             .get(txid)
             .is_some_and(|tags| tags.contains(&MarketplaceTag::Offer))
-            || self.marketplace_proofs.get(txid).is_some_and(|proofs| {
-                proofs
-                    .iter()
-                    .any(|proof| self.marketplace_proof_matches(proof, txid))
-            })
+            || self.marketplace_contract(txid).is_some()
     }
 
     fn marketplace_tags(&self, txid: &str) -> impl Iterator<Item = MarketplaceTag> {
@@ -1284,29 +1301,25 @@ impl ObjectStore {
         if self.marketplace_offer(txid) {
             tags.insert(MarketplaceTag::Offer);
         }
+        if let Some(offer) = self.marketplace_publication(txid)
+            && self
+                .transaction(&offer.funding)
+                .is_some_and(|tx| marketplace_funding_shape(&tx.raw_json))
+        {
+            tags.insert(MarketplaceTag::OfferProof);
+        }
         if let Some(tx) = self.transaction(txid) {
-            if tx.prepared.as_deref().is_some_and(|data| {
-                data.proof_funders
-                    .iter()
-                    .any(|funding| self.marketplace_proof_matches(txid, funding))
-            }) {
-                tags.insert(MarketplaceTag::OfferProof);
-            }
-            if self.marketplace_spends.get(txid).is_some_and(|funders| {
-                funders.iter().any(|funding| {
-                    self.transaction(funding)
-                        .and_then(|tx| tx.prepared.as_deref())
-                        .and_then(|data| data.marketplace_spender.as_deref())
-                        == Some(txid)
-                        && self.marketplace_offer(funding)
-                })
-            }) {
-                let count = tx.raw_json["vin"].as_array().map_or(0, Vec::len);
-                tags.insert(if count > 1 {
-                    MarketplaceTag::OfferTaken
-                } else {
-                    MarketplaceTag::OfferClosed
-                });
+            match self.marketplace_execution(&tx.raw_json) {
+                Some(marketplace_trace::Spend::Taken) => {
+                    tags.insert(MarketplaceTag::OfferTaken);
+                }
+                Some(marketplace_trace::Spend::Closed { .. }) => {
+                    tags.insert(MarketplaceTag::OfferClosed);
+                }
+                None if marketplace_trace::recovery::recover(&tx.raw_json, self).is_some() => {
+                    tags.insert(MarketplaceTag::OfferReleased);
+                }
+                None => {}
             }
         }
         tags.into_iter()
@@ -1314,35 +1327,16 @@ impl ObjectStore {
 }
 
 fn marketplace_funding_shape(raw: &Value) -> bool {
-    let Some(script) = transaction_output(raw, 0)
-        .and_then(|output| output.get("scriptPubKey"))
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-    script.contains_key("identityprimary") || script.contains_key("commitmenthash")
+    transaction_output(raw, 0).is_some_and(|output| {
+        let script = &output["scriptPubKey"];
+        (script["identityprimary"].is_object() || script["commitmenthash"].is_object())
+            && marketplace_trace::native_amount(output)
+                .is_some_and(|amount| amount >= marketplace_trace::OFFER_FEE)
+    })
 }
 
 fn transaction_output(raw: &Value, index: usize) -> Option<&Value> {
     raw.get("vout").and_then(Value::as_array)?.get(index)
-}
-
-fn contains_marketplace_offer_proof(raw: &Value) -> bool {
-    raw.get("vout")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|output| output.get("scriptPubKey"))
-        .filter_map(|script| script.get("hex").and_then(Value::as_str))
-        .any(op_return_starts_with_transaction_proof)
-}
-
-fn op_return_starts_with_transaction_proof(script_hex: &str) -> bool {
-    script_hex
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("6a"))
-        && extract_op_return_payload(script_hex)
-            .is_some_and(|payload| payload.starts_with(&[5, 0, 0, 0, 3]))
 }
 
 fn extract_op_return_payload(script_hex: &str) -> Option<Vec<u8>> {
@@ -1905,6 +1899,7 @@ fn revision_sender(config: &Config, tx: UnboundedSender<AppEvent>) -> UnboundedS
 }
 
 fn invalidate_reorg_views(state: &mut AppState) {
+    state.store.marketplace_searches.clear();
     state.store.registration_payments.clear();
     state.store.token_control.clear();
     state
@@ -3663,7 +3658,7 @@ fn defi_lines(panel: &DefiPanel, store: &ObjectStore, theme: &Theme) -> Vec<Line
         for (index, item) in report.entries.iter().enumerate() {
             if matches!(
                 item.label.as_str(),
-                "Conversion" | "Reserve transfer" | "Cross-system transfer"
+                "Conversion" | "Reserve transfer" | "Cross-system transfer" | "Launch contribution"
             ) && let Some((number, leg)) = report
                 .legs
                 .iter()
@@ -5336,6 +5331,17 @@ fn run_loop(
                 ) && is_open_key(code) =>
                 {
                     open_selected_address_transaction(state, config, &tx);
+                }
+                KeyCode::Char('e')
+                    if matches!(
+                        state.screen,
+                        Screen::Transaction {
+                            mode: ViewMode::Overview,
+                            ..
+                        }
+                    ) =>
+                {
+                    marketplace_trace::search::start(state, config, &tx);
                 }
                 KeyCode::Char('b') if matches!(state.screen, Screen::Transaction { .. }) => {
                     open_transaction_block(state, config, &tx);
@@ -7265,6 +7271,13 @@ fn handle_app_event(state: &mut AppState, app_event: AppEvent) {
 fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
     match app_event {
         AppEvent::NotarizationChanged => {}
+        AppEvent::MarketplaceSearch {
+            funding,
+            request,
+            page,
+        } => {
+            marketplace_trace::search::finish(state, funding, request, *page);
+        }
         AppEvent::TokenControl {
             identity,
             request,
@@ -8336,16 +8349,20 @@ fn request_transaction_context(
         .collect::<Vec<_>>();
     let spending_confirmed = transaction.block_hash.is_some();
     let mut requested = source_txids.clone();
-    if state
-        .store
-        .marketplace_tags(txid)
-        .any(|tag| tag == MarketplaceTag::Offer)
-    {
-        requested.extend(marketplace_related_spenders(&transaction.raw_json));
+    if marketplace_funding_shape(&transaction.raw_json) {
+        requested.extend(marketplace_related_spenders(
+            &transaction.raw_json,
+            state.store.marketplace_offer(txid),
+        ));
+    }
+    if let Some(offer) = state.store.marketplace_publication(txid) {
+        requested.push(offer.funding.clone());
     }
     for source_txid in source_txids {
-        if let Some(source) = state.store.transaction(&source_txid) {
-            requested.extend(marketplace_related_spenders(&source.raw_json));
+        if let Some(source) = state.store.transaction(&source_txid)
+            && marketplace_funding_shape(&source.raw_json)
+        {
+            requested.extend(marketplace_related_spenders(&source.raw_json, false));
         }
     }
     requested.sort();
@@ -8366,12 +8383,16 @@ fn request_transaction_context(
     }
 }
 
-fn marketplace_related_spenders(raw: &Value) -> impl Iterator<Item = String> + '_ {
+fn marketplace_related_spenders(
+    raw: &Value,
+    include_spend: bool,
+) -> impl Iterator<Item = String> + '_ {
     raw.get("vout")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .take(2)
+        .skip(usize::from(!include_spend))
         .filter_map(|output| output.get("spentTxId").and_then(Value::as_str))
         .map(str::to_string)
 }
@@ -11481,7 +11502,7 @@ fn help_lines(theme: &Theme, state: &AppState, cache_path: &std::path::Path) -> 
         (
             "Transactions",
             &[
-                "b opens containing block | F7 inclusion history | F8 DeFi trail | j/k selects each source transaction and address link",
+                "b opens containing block | e searches historical offer proofs | F7 inclusion history | F8 DeFi trail | j/k selects each source transaction and address link",
             ],
         ),
         (
@@ -12529,7 +12550,7 @@ fn control_help(screen: &Screen) -> &'static str {
             mode: ViewMode::Overview,
             ..
         } => {
-            "j/k select input/output | Enter follow | b block | F3 links | F4 witnesses | F7 inclusions | F8 DeFi trail | Tab JSON | Left/h back"
+            "j/k select input/output | Enter follow | b block | F3 links | F4 witnesses | F7 inclusions | F8 DeFi trail | e offer proof | Tab JSON | Left/h back"
         }
         Screen::Address { .. } => {
             "j/k or arrows select identity/tx, Enter/Right/l opens, Left/h or Esc goes back"
@@ -14425,12 +14446,7 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
     let mut flows = Vec::new();
     let registration = registration_payments::report(raw, store);
     let auto_arbitrage_inputs = import_auto_arbitrage_input_indexes(raw, store);
-    let marketplace_tags = raw
-        .get("txid")
-        .and_then(Value::as_str)
-        .map(|txid| store.marketplace_tags(txid).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let closes_offer = marketplace_tags.contains(&MarketplaceTag::OfferClosed);
+    let market = marketplace_trace::FlowEvidence::new(raw, store);
     if let Some(inputs) = raw.get("vin").and_then(Value::as_array) {
         flows.extend(inputs.iter().enumerate().map(|(index, input)| {
             let prevout = input
@@ -14452,18 +14468,8 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
             } else {
                 prevout.unwrap_or(input)
             };
-            let marketplace_cancellation = input
-                .get("txid")
-                .and_then(Value::as_str)
-                .zip(input.get("vout").and_then(Value::as_u64))
-                .is_some_and(|(txid, index)| {
-                    index == 0
-                        && store
-                            .marketplace_tags(txid)
-                            .any(|tag| tag == MarketplaceTag::Offer)
-                });
             TransactionFlow {
-                references: crate::protocol::References::default(),
+                references: market.input_links(index),
                 routing: BTreeMap::new(),
                 kind: TransactionFlowKind::Input,
                 index,
@@ -14491,8 +14497,9 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
                 private: false,
                 tags: Vec::new(),
                 annotations: {
-                    let mut annotations = marketplace_cancellation
-                        .then(|| "Marketplace Offer Cancellation".to_string())
+                    let mut annotations = market
+                        .input_annotation(index)
+                        .map(str::to_owned)
                         .into_iter()
                         .collect::<Vec<_>>();
                     if auto_arbitrage_inputs.contains(&index) {
@@ -14574,7 +14581,6 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
     let emission_timelock = emission_timelock(raw);
     let stake = crate::domain::is_stake_transaction(raw);
     let enforcement = stakeguard_enforcement(raw, store);
-    let market_proof = marketplace_tags.contains(&MarketplaceTag::OfferProof);
     if let Some(outputs) = raw.get("vout").and_then(Value::as_array) {
         flows.extend(outputs.iter().enumerate().map(|(index, output)| {
             let script = output.get("scriptPubKey").unwrap_or(&Value::Null);
@@ -14600,11 +14606,8 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
                 });
             }
 
-            let mut annotations = (closes_offer
-                && script.get("type").and_then(Value::as_str) != Some("nulldata"))
-            .then(|| "Marketplace Offer Refund".to_string())
-            .into_iter()
-            .collect::<Vec<_>>();
+            let mut annotations = Vec::new();
+            market.output_evidence(index, &mut references, &mut annotations);
             annotations.extend(
                 registration
                     .and_then(|report| report.annotation(index))
@@ -14628,10 +14631,7 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
                 let known_data = (stake && index == 1)
                     || (enforcement && index + 1 == outputs.len())
                     || emission_timelock.is_some_and(|lock| index == lock.metadata_output_index)
-                    || (market_proof
-                        && script["hex"]
-                            .as_str()
-                            .is_some_and(op_return_starts_with_transaction_proof));
+                    || market.is_publication_output(index);
                 if !known_data && let Some(data) = crate::domain::arbitrary_op_return(output) {
                     references.links.push(crate::protocol::Link {
                         label: "View OP_RETURN bytes".into(),
@@ -14707,37 +14707,30 @@ fn transaction_flows(raw: &Value, store: &ObjectStore) -> Vec<TransactionFlow> {
                 let mut annotations = derived_sapling_output
                     .map(|_| vec!["Derived from Sapling valueBalance".to_string()])
                     .unwrap_or_default();
-                if closes_offer {
-                    annotations.push("Marketplace Offer Refund".to_string());
-                }
+                annotations.extend(market.shielded_annotation().map(str::to_owned));
                 annotations
             },
         }
     }));
     let sprout_output_count = private_output_count(raw).saturating_sub(sapling_output_count);
-    flows.extend((0..sprout_output_count).map(|offset| {
-        TransactionFlow {
-            references: crate::protocol::References::default(),
-            routing: BTreeMap::new(),
-            kind: TransactionFlowKind::Output,
-            index: transparent_outputs + sapling_output_count + offset,
-            addresses: Vec::new(),
-            reserve_amounts: BTreeMap::new(),
-            value_zat: None,
-            value_label: "hidden".to_string(),
-            source_txid: None,
-            source_vout: None,
-            sequence: None,
-            script_type: Some("Sprout".to_string()),
-            spendable: None,
-            coinbase: false,
-            private: true,
-            tags: Vec::new(),
-            annotations: closes_offer
-                .then(|| "Marketplace Offer Refund".to_string())
-                .into_iter()
-                .collect(),
-        }
+    flows.extend((0..sprout_output_count).map(|offset| TransactionFlow {
+        references: crate::protocol::References::default(),
+        routing: BTreeMap::new(),
+        kind: TransactionFlowKind::Output,
+        index: transparent_outputs + sapling_output_count + offset,
+        addresses: Vec::new(),
+        reserve_amounts: BTreeMap::new(),
+        value_zat: None,
+        value_label: "hidden".to_string(),
+        source_txid: None,
+        source_vout: None,
+        sequence: None,
+        script_type: Some("Sprout".to_string()),
+        spendable: None,
+        coinbase: false,
+        private: true,
+        tags: Vec::new(),
+        annotations: Vec::new(),
     }));
     flows
 }
@@ -22937,93 +22930,128 @@ mod tests {
     }
 
     #[test]
-    fn marketplace_proof_correlates_funding_and_taken_transactions() {
-        let funding_txid = "funding";
-        let proof_txid = "proof";
-        let taken_txid = "taken";
-        let mut store = ObjectStore::default();
+    fn historical_marketplace_links_settlement_and_rejects_a_changed_payment() {
+        let funding = "1".repeat(64);
+        let proof = "2".repeat(64);
+        let taken = "3".repeat(64);
+        let mut store = ObjectStore {
+            workspace_system: crate::world::system_id("VRSC", crate::world::Network::Mainnet).ok(),
+            ..Default::default()
+        };
         store.insert_transaction(test_transaction(
-            funding_txid,
+            &funding,
             json!({
-                "txid": funding_txid,
-                "vin": [],
+                "txid": funding, "vin": [],
                 "vout": [
-                    { "n": 0, "spentTxId": taken_txid, "scriptPubKey": {
-                        "commitmenthash": { "hash": "00" }
+                    {"n": 0, "valueSat": 90000, "spentTxId": taken, "scriptPubKey": {
+                        "commitmenthash": {"currencyvalues": {"iSynthetic": 1}}
                     }},
-                    { "n": 1, "spentTxId": proof_txid, "scriptPubKey": { "type": "pubkeyhash" }}
+                    {"n": 1, "scriptPubKey": {"type": "pubkeyhash"}}
                 ]
             }),
         ));
         store.insert_transaction(test_transaction(
-            proof_txid,
+            &proof,
             json!({
-                "txid": proof_txid,
-                "vin": [{ "txid": funding_txid, "vout": 1 }],
-                "vout": [{ "scriptPubKey": { "hex": "6a050500000003" }}]
+                "txid": proof, "vin": [{"txid": funding, "vout": 1}],
+                "vout": [{"n": 0, "scriptPubKey": {
+                    "hex": marketplace_trace::test_publication(1, 50000)
+                }}]
             }),
         ));
-        store.insert_transaction(test_transaction(
-            taken_txid,
-            json!({
-                "txid": taken_txid,
-                "vin": [
-                    { "txid": funding_txid, "vout": 0 },
-                    { "txid": "taker-funds", "vout": 0 }
-                ],
-                "vout": []
-            }),
-        ));
-
+        let mut settled = json!({
+            "txid": taken, "height": 50, "version": 4, "overwintered": true,
+            "expiryheight": 100, "locktime": 0,
+            "vin": [{"txid": funding, "vout": 0, "sequence": 4294967295u32, "scriptSig": {"hex": "51"}},
+                    {"txid": "other", "vout": 0}],
+            "vout": [
+                {"n": 0, "valueSat": 50000, "scriptPubKey": {"hex": "52"}},
+                {"n": 1, "valueSat": 10000,
+                 "scriptPubKey": {"reserveoutput": {"currencyvalues": {"iSynthetic": 1}}}}
+            ]
+        });
+        store.insert_transaction(test_transaction(&taken, settled.clone()));
         assert!(
             store
-                .marketplace_tags(funding_txid)
+                .marketplace_tags(&funding)
                 .any(|tag| tag == MarketplaceTag::Offer)
         );
         assert!(
             store
-                .marketplace_tags(proof_txid)
+                .marketplace_tags(&proof)
                 .any(|tag| tag == MarketplaceTag::OfferProof)
         );
         assert!(
             store
-                .marketplace_tags(taken_txid)
+                .marketplace_tags(&taken)
                 .any(|tag| tag == MarketplaceTag::OfferTaken)
         );
+        let flows = transaction_flows(&settled, &store);
+        assert_eq!(flows[0].annotations, ["Marketplace Offer Settlement"]);
+        assert_eq!(flows[2].annotations, ["Marketplace Seller Consideration"]);
+        assert_eq!(flows[3].annotations, ["Marketplace Taker Delivery"]);
+        assert_eq!(flows[2].references.links.len(), 2);
+        let funding_flows =
+            transaction_flows(&store.transaction(&funding).unwrap().raw_json, &store);
+        assert_eq!(funding_flows[0].references.links.len(), 2);
+        settled["vout"][0]["valueSat"] = json!(50001);
+        store.replace_transaction(test_transaction(&taken, settled.clone()));
+        assert!(
+            !store
+                .marketplace_tags(&taken)
+                .any(|tag| tag == MarketplaceTag::OfferTaken)
+        );
+        let flows = transaction_flows(&settled, &store);
+        assert_eq!(
+            flows[0].annotations,
+            ["Marketplace Funding Spend · outcome unverified"]
+        );
+        assert!(flows[2].annotations.is_empty());
     }
 
     #[test]
-    fn marketplace_close_marks_cancellation_input_and_refund_output() {
+    fn marketplace_close_validates_the_refund_and_links_embedded_publication() {
+        let funding = "1".repeat(64);
+        let posting = "2".repeat(64);
         let mut store = ObjectStore::default();
         store.insert_transaction(test_transaction(
-            "funding",
+            &funding,
             json!({
-                "txid": "funding",
-                "vin": [],
-                "vout": [
-                    { "n": 0, "spentTxId": "close", "scriptPubKey": { "commitmenthash": {} } },
-                    { "n": 1, "spentTxId": "proof", "scriptPubKey": { "type": "pubkeyhash" } }
+                "txid": funding, "vin": [], "vout": [
+                    {"n": 0, "valueSat": 90000, "scriptPubKey": {"commitmenthash": {}}},
+                    {"n": 1, "scriptPubKey": {"type": "pubkeyhash"}}
                 ]
             }),
         ));
         store.insert_transaction(test_transaction(
-            "proof",
+            &posting,
             json!({
-                "txid": "proof",
-                "vin": [{ "txid": "funding", "vout": 1 }],
-                "vout": [{ "scriptPubKey": { "hex": "6a050500000003" }}]
+                "txid": posting, "vin": [], "vout": [
+                    {"n": 0, "valueSat": 10000, "scriptPubKey": {"commitmenthash": {}}},
+                    {"n": 1, "scriptPubKey": {"hex": marketplace_trace::test_publication(1, 50000)}}
+                ]
             }),
         ));
-        let close = json!({
+        assert!(
+            store
+                .marketplace_tags(&posting)
+                .any(|tag| tag == MarketplaceTag::OfferProof)
+        );
+        let mut close = json!({
             "txid": "close",
-            "vin": [{ "txid": "funding", "vout": 0 }],
-            "vout": [{ "n": 0, "scriptPubKey": { "type": "pubkeyhash" } }]
+            "vin": [{"txid": funding, "vout": 0}],
+            "vout": [{"n": 0, "valueSat": 80000, "scriptPubKey": {"type": "cryptocondition", "evalnone": "valid", "spendableoutput": true}}]
         });
-        store.insert_transaction(test_transaction("close", close.clone()));
-
         let flows = transaction_flows(&close, &store);
         assert_eq!(flows[0].annotations, ["Marketplace Offer Cancellation"]);
         assert_eq!(flows[1].annotations, ["Marketplace Offer Refund"]);
+        close["vout"][0]["valueSat"] = json!(80001);
+        let flows = transaction_flows(&close, &store);
+        assert_eq!(
+            flows[0].annotations,
+            ["Marketplace Funding Spend · outcome unverified"]
+        );
+        assert!(flows[1].annotations.is_empty());
     }
 
     fn notes_offer(id: &str, name: &str, price: Option<f64>) -> MarketplaceOffer {

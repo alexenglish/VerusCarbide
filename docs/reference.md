@@ -456,6 +456,62 @@ an altered-prefix rejection and the imported Burn tag through isolated daemons.
 Supplemental burn instruction tags do not assert an independently correlated
 Ethereum receipt or a replayed customer payment.
 
+### Import submission rewards in F8
+
+For a supported settled PBaaS import, F8 links the verified customer receipt
+and the payouts to the import proposer, configured notary, source block
+producer, and primary exporter. Open F8 from the main import or follow the
+original reserve transfer. The trail also links the producer coinbase and the
+original chain definition used to select the notary. The converted fee and
+its unattributed remainder are shown separately from verified payments.
+
+For cross-system imports, coverage applies to the single-transfer,
+four-payment native layout. Both chains need enabled sources. For
+same-system fractional launches and settled reserve-to-reserve batches,
+F8 verifies the native exporter payments using the execution prices
+and liquidity retention for that phase.
+
+When transfers come from several heights, the producer lookup uses the
+entropy at the export's source-end height to select from the distinct source
+heights. A proof-of-stake entropy lookup requires the raw PoS hash from
+the header. When the recipient scripts and amounts verify, F8 can show the
+exporter payments while leaving the producer role unattributed. Direct
+reserve-denominated service payouts remain outside this coverage.
+
+### Successful launch funding in F8
+
+Open F8 on a preconversion contribution or the main import that issued its
+receipt. For supported same-system fractional launches, the trail validates the
+ordered contributions and exact receipt scripts and amounts. It links the
+original definition, launch-clear import, and launch-complete import. Starting
+from the receipt import shows every verified contribution and receipt.
+The initial window can move closer to the scheduled launch for a contribution
+exported well before launch. The verified receipts exclude service payments and
+reserve-maintenance outputs.
+
+### Historical marketplace trails
+
+Open a transaction and use its input and output links to follow the marketplace
+funding output, signed offer publication, and funding spender. Historical links
+use transaction data from the configured source. They also work for spent and
+expired offers, since they do not require an entry in `getoffers`.
+
+The trace reads full offer templates from the last OP_RETURN of a separate
+publication or a transaction that embeds the proof. A **Marketplace Offer
+Taken** result binds the signed funding input and the exact seller consideration
+to the observed transaction, then identifies the taker delivery output. A
+supported standalone close matches the original assets, net of the wallet close
+fee. The flow identifies any transparent or shielded refund without exposing
+private recipients. Custom and batched spends show verified identity and
+currency returns when the outputs reconcile. Shared funding stays grouped
+when identical assets came from several inputs. A spend with insufficient
+evidence remains unverified.
+
+Select funding output 0, or the input that spends it, and press `e` to look
+for an embedded publication. Each pass checks up to eight confirmed
+blocks on the funding source. Repeat `e` to resume at the next block. The
+search requires a source that can return decoded block transactions.
+
 DeFi accounting keeps instruction principal, transfer custody and transaction fees distinct. Transfer custody includes explicit and valid gateway fee budgets and excludes mint principal. Protocol transactions show a public native delta and an unavailable consensus fee when descriptor accounting cannot be reconstructed. Missing required shielded public balances remain unknown; individual private values remain hidden.
 
 ## Badge capitalization

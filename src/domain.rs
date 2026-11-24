@@ -78,6 +78,7 @@ pub enum MarketplaceTag {
     Offer,
     OfferClosed,
     OfferProof,
+    OfferReleased,
     OfferTaken,
 }
 
@@ -87,6 +88,7 @@ impl MarketplaceTag {
             Self::Offer => "Marketplace Offer",
             Self::OfferClosed => "Marketplace Offer Closed",
             Self::OfferProof => "Marketplace Offer Proof",
+            Self::OfferReleased => "Marketplace Funding Released",
             Self::OfferTaken => "Marketplace Offer Taken",
         }
     }
@@ -828,7 +830,7 @@ fn has_positive_native_value(output: &Value) -> bool {
             .is_some_and(|value| value > 0.0)
 }
 
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(value: &str) -> Option<Vec<u8>> {
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() {
         return None;

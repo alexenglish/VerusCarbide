@@ -7,6 +7,8 @@ mod fee_pool;
 #[cfg(test)]
 mod fixtures;
 mod import;
+mod import_rewards;
+mod launch_funding;
 pub mod pool;
 mod replay;
 mod route;
@@ -214,16 +216,21 @@ pub fn roots(transaction: &Value) -> Vec<(u32, String)> {
                 .then(|| (i as u32, "Currency import".into()));
             }
             let transfer = output["scriptPubKey"].get("reservetransfer")?;
-            let label = if transfer["convert"].as_bool() == Some(true) {
-                "Conversion"
-            } else if transfer["crosssystem"].as_bool() == Some(true) {
-                "Cross-system transfer"
-            } else {
-                "Reserve transfer"
-            };
-            Some((i as u32, label.into()))
+            Some((i as u32, transfer_label(transfer).into()))
         })
         .collect()
+}
+
+fn transfer_label(transfer: &Value) -> &'static str {
+    if transfer["preconvert"].as_bool() == Some(true) {
+        "Launch contribution"
+    } else if transfer["convert"].as_bool() == Some(true) {
+        "Conversion"
+    } else if transfer["crosssystem"].as_bool() == Some(true) {
+        "Cross-system transfer"
+    } else {
+        "Reserve transfer"
+    }
 }
 
 fn output(tx: &Value, vout: u32) -> Option<&Value> {
@@ -432,16 +439,9 @@ async fn investigate_leg(
             "Source transfer is unconfirmed or outside the active chain; its route is provisional",
         );
     }
-    let kind = if transfer["convert"].as_bool() == Some(true) {
-        "Conversion"
-    } else if transfer["crosssystem"].as_bool() == Some(true) {
-        "Cross-system transfer"
-    } else {
-        "Reserve transfer"
-    };
     trail.entries.push(entry(
         &root,
-        kind,
+        transfer_label(transfer),
         format!(
             "values={}  fee={} {}  import currency={}  destination={}  address={}",
             transfer["currencyvalues"],
@@ -695,7 +695,24 @@ async fn continue_from_spender(
                 "Export is not confirmed; import cannot yet be bounded",
             );
         };
-        height.saturating_add(IMPORT_WINDOW - 1).min(tip)
+        let ordinary_end = height.saturating_add(IMPORT_WINDOW - 1).min(tip);
+        if matches!(search, ImportSearch::Initial)
+            && transfer["flags"].as_u64() == Some(7)
+            && let Ok(definition) = dest_client
+                .call_on(&export_source, "getcurrency", &[json!(currency)])
+                .await
+            && definition["currencyid"].as_str() == Some(currency)
+            && definition["launchsystemid"].as_str() == Some(destination)
+            && let Some(launch) = definition["startblock"].as_u64()
+            && launch > ordinary_end
+            && launch <= tip
+        {
+            let end = launch.saturating_add(IMPORT_WINDOW / 2).min(tip);
+            trail.notes.push(format!("Initial import window is centered near the currency's scheduled launch at {launch}. Use [ or s to check earlier windows."));
+            end
+        } else {
+            ordinary_end
+        }
     } else {
         tip
     };
@@ -947,6 +964,77 @@ async fn continue_from_spender(
             "Accepted notarization records the verified supply reduction for the ordered batch",
         ));
         return trail;
+    }
+    if launch_funding::applicable(found) && transfer["flags"].as_u64() == Some(7) {
+        if import_source.as_deref() == Some(export_source.as_str())
+            && destination == root.system_id.as_ref()
+            && let Some(verified) = (launch_funding::Evidence {
+                source: &export_source,
+                root: &import_ref,
+                record: found,
+                import_tx: &import_tx,
+                export_tx: &spent,
+                export_vout,
+            })
+            .verify(&dest_client)
+            .await
+            && let Some(receipt) = verified
+                .receipts
+                .get(batch_offset)
+                .filter(|receipt| receipt.funding == root)
+        {
+            trail.legs[0].replayed(
+                replay::ReplayProof {
+                    offset: receipt.offset,
+                    proceeds: None,
+                    satoshis: None,
+                    kind: replay::ReplayKind::Preconversion,
+                },
+                receipt.output.clone(),
+                &region[receipt.offset],
+            );
+            trail.edges = lifecycle_edges(&root, &trail);
+            verified.links(&mut trail, &import_ref);
+            verified.add_receipt(&mut trail, receipt);
+            if let Some(rewards) = &verified.rewards {
+                rewards.append(&mut trail, &import_ref);
+            }
+            trail.notes.push("Verified all ordered launch receipts against their export inputs, primary identity scripts, and exact amounts. Customer totals exclude later generated outputs and reserve maintenance.".into());
+            return trail;
+        }
+        trail.notes.push("The confirmed launch receipt could not be verified from the available definition, export inputs, and linked launch phases.".into());
+    }
+    if import_rewards::applicable(found) {
+        if let Some(observing_source) = import_source.as_deref()
+            && let Some(rewards) = (import_rewards::Evidence {
+                source: &client,
+                source_id: &export_source,
+                destination: &dest_client,
+                destination_id: observing_source,
+                root: &import_ref,
+                record: found,
+                import_tx: &import_tx,
+                export_tx: &spent,
+            })
+            .verify()
+            .await
+            && rewards.funding == root
+        {
+            trail.legs[0].replayed(
+                replay::ReplayProof {
+                    offset: 0,
+                    proceeds: None,
+                    satoshis: None,
+                    kind: replay::ReplayKind::ReservePlain,
+                },
+                rewards.customer.clone(),
+                &region[0],
+            );
+            trail.edges = lifecycle_edges(&root, &trail);
+            rewards.append(&mut trail, &import_ref, false);
+            return trail;
+        }
+        trail.notes.push("Submission rewards remain unattributed for this import. Their calculation requires the original export and definition, the producer block, and the active entropy header.".into());
     }
     // Definitions are immutable; request one only for the narrow prelaunch
     // branch and require the same enabled source that supplied the import.
@@ -1223,6 +1311,22 @@ async fn continue_from_spender(
         trail.notes.push("No import output matched the transfer destination address; inspect all import outputs manually.".into());
     } else {
         trail.notes.push(format!("{count} generated output(s) matched the transfer destination address or exact prefix replay. Only entries labeled replayed or direct are individually attributed; other matches remain candidates."));
+    }
+    if import_source.as_deref() == Some(export_source.as_str())
+        && import_rewards::exporters::settled_applicable(found, root.system_id.as_ref())
+        && let Some(verified) = (import_rewards::exporters::SettledEvidence {
+            source: &export_source,
+            root: &import_ref,
+            record: found,
+            import_tx: &import_tx,
+            export_tx: &spent,
+            export_vout,
+        })
+        .verify(&dest_client)
+        .await
+    {
+        trail.edges = lifecycle_edges(&root, &trail);
+        verified.rewards.append(&mut trail, &import_ref);
     }
     trail
 }
