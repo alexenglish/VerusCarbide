@@ -186,11 +186,16 @@ pub fn system_id(chain: &str, network: Network) -> Result<SystemId> {
             network,
         )?
     };
-    let mut bytes = vec![102];
-    bytes.extend_from_slice(&hash);
+    SystemId::try_from(base58_check(102, &hash))
+}
+
+pub(crate) fn base58_check(prefix: u8, hash: &[u8]) -> String {
+    let mut bytes = vec![prefix];
+    bytes.extend_from_slice(hash);
     let checksum = double_sha(&bytes);
     bytes.extend_from_slice(&checksum[..4]);
-    let mut digits = vec![0u8];
+    let leading_zeros = bytes.iter().take_while(|&&byte| byte == 0).count();
+    let mut digits = Vec::new();
     for byte in bytes {
         let mut carry = u32::from(byte);
         for digit in &mut digits {
@@ -203,13 +208,14 @@ pub fn system_id(chain: &str, network: Network) -> Result<SystemId> {
             carry /= 58;
         }
     }
-    SystemId::try_from(
-        digits
-            .iter()
-            .rev()
-            .map(|d| BASE58[*d as usize] as char)
-            .collect::<String>(),
-    )
+    std::iter::repeat_n('1', leading_zeros)
+        .chain(
+            digits
+                .iter()
+                .rev()
+                .map(|digit| BASE58[*digit as usize] as char),
+        )
+        .collect()
 }
 
 #[cfg(test)]

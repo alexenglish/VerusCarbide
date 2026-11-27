@@ -1,4 +1,6 @@
 //! Permission, polling mode and observed endpoint traffic are separate columns.
+pub(super) mod zmq_setup;
+
 use super::*;
 use crate::sources::{
     ChainCheck, Communication, CommunicationOutcome, ConnectionState, Control, Registry,
@@ -177,6 +179,77 @@ pub(super) fn render(
     );
 }
 
+fn zmq_status_line(theme: &Theme, control: &crate::sources::Control) -> Line<'static> {
+    use crate::zmq::FeedStatus;
+
+    let feeds = control.zmq.feeds();
+    let count = feeds.len();
+    let connected = feeds
+        .iter()
+        .filter(|(_, _, status)| matches!(status, FeedStatus::Connected | FeedStatus::Receiving(_)))
+        .count();
+    let received = feeds
+        .iter()
+        .filter_map(|(_, _, status)| match status {
+            FeedStatus::Receiving(last) => Some(*last),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let unavailable = feeds
+        .iter()
+        .filter(|(_, _, status)| {
+            matches!(
+                status,
+                FeedStatus::Conflict | FeedStatus::Unreachable | FeedStatus::Error(_)
+            )
+        })
+        .count();
+    let config_error = !control.zmq.settings().errors.is_empty();
+    let (mut summary, style) = if count == 0 && !config_error {
+        ("Not configured".into(), theme.muted())
+    } else if !control.polling() && count > 0 {
+        let text = if control.state() == ConnectionState::Disabled {
+            "Configured · source disabled"
+        } else {
+            "Configured · select or monitor this source"
+        };
+        (text.into(), theme.muted())
+    } else if let Some(last) = received.iter().max() {
+        (
+            format!(
+                "Receiving · last {} ago · {}/{} topics seen",
+                short_age(last.elapsed().as_secs()),
+                received.len(),
+                count
+            ),
+            theme.positive(),
+        )
+    } else if connected > 0 {
+        (
+            format!("Connected · waiting for events · {connected}/{count} topics connected"),
+            theme.link(),
+        )
+    } else if config_error
+        || feeds
+            .iter()
+            .any(|(_, _, status)| matches!(status, FeedStatus::Error(_)))
+    {
+        ("Setup needs attention".into(), theme.warning())
+    } else if unavailable > 0 {
+        ("Unreachable · retrying".into(), theme.warning())
+    } else {
+        ("Waiting for connection".into(), theme.muted())
+    };
+    if connected > 0 && unavailable > 0 {
+        summary.push_str(&format!(" · {unavailable} unavailable"));
+    }
+    Line::from(vec![
+        Span::styled("ZMQ  ", theme.muted()),
+        Span::styled(summary, style),
+        Span::styled("  ·  z setup", theme.muted()),
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_rows(
     frame: &mut Frame<'_>,
@@ -193,7 +266,7 @@ fn render_rows(
         frame,
         theme,
         "Sources — F2",
-        "j/k select | Enter current chain | e enable/disable | m monitoring | s save | a activity | Esc close | q quit",
+        "j/k select | Enter current chain | e enable/disable | m monitoring | s save | a activity | z ZMQ setup | Esc close | q quit",
     );
     let instructions = Paragraph::new(vec![
         Line::from(vec![
@@ -368,6 +441,11 @@ fn render_rows(
             }
             if api.is_none() {
                 details.insert(1, chain_check_line(theme, control, stale_after));
+                if config.daemon.config_file.is_some()
+                    && crate::zmq::setup::local_host(&config.daemon.host)
+                {
+                    details.insert(2, zmq_status_line(theme, control));
+                }
             }
         }
     }

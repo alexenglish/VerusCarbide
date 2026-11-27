@@ -604,6 +604,10 @@ impl ChainState {
         self.height?.checked_sub(block.height)?.checked_add(1)
     }
 
+    pub fn remove_confirmed_from_mempool(&mut self, confirmed: &HashSet<String>) {
+        self.mempool.retain(|txid| !confirmed.contains(txid));
+    }
+
     pub fn in_mempool(&self, txid: &str) -> bool {
         self.online && !self.reconciling && self.mempool.contains(txid)
     }

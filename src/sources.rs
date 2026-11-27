@@ -89,6 +89,7 @@ pub struct Control {
     communication: std::sync::Mutex<Communication>,
     chain_check: std::sync::Mutex<Option<(u64, ChainCheck)>>,
     pub branch_epoch: AtomicU64,
+    pub zmq: crate::zmq::Hub,
     // 0 unknown, 1 available, 2 unavailable; shared by clients for this source.
     identity_index: AtomicU64,
     unsupported_methods: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -106,6 +107,7 @@ impl Default for Control {
             communication: Default::default(),
             chain_check: Default::default(),
             branch_epoch: AtomicU64::new(0),
+            zmq: Default::default(),
             identity_index: AtomicU64::new(0),
             unsupported_methods: Default::default(),
             reconciliation_heights: Default::default(),

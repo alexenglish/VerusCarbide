@@ -25,6 +25,7 @@ mod sources;
 mod theme;
 mod witnesses;
 mod world;
+mod zmq;
 
 use anyhow::Context;
 use cache::Cache;

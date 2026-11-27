@@ -395,6 +395,14 @@ def run_mempool():
                 terminal.key(b'm')
                 wait(terminal, 'Coinbase')
                 wait(terminal, 'fee 0.00020000')
+                wait(terminal, initial)
+                terminal.resize(60, 30)
+                wait(terminal, 'Mempool')
+                assert initial not in terminal.screen()
+                assert 'eeeeee...' in terminal.screen()
+                assert ' ago' in next(row for row in terminal.screen().splitlines() if 'eeeeee...' in row)
+                terminal.resize(160, 40)
+                wait(terminal, initial)
                 bulk = ('getrawmempool', [True, {'fulltxes': True}])
                 assert bulk in server.requests
                 assert ('getrawtransaction', [initial, 1]) not in server.requests

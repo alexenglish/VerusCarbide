@@ -74,7 +74,6 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 type BlockHash = String;
 type Txid = String;
 const DASHBOARD_BLOCK_COUNT: u64 = 12;
-const DASHBOARD_TRANSACTION_COUNT: usize = 100;
 const DASHBOARD_LOADING_FRAME: Duration = Duration::from_millis(125);
 const TRANSACTION_TILE_HEIGHT: u16 = 5;
 const TRANSACTION_FLOW_TILE_HEIGHT: u16 = 6;
@@ -90,6 +89,7 @@ const ADDRESS_FLOW_LIMIT: usize = 6;
 const ADDRESS_TRANSACTION_TILE_MIN_HEIGHT: u16 = 3;
 const PEER_REFRESH_SECONDS: u64 = 5;
 const MEMPOOL_REFRESH_SECONDS: u64 = 2;
+const MEMPOOL_NOTIFICATION_FOLLOW_UP: Duration = Duration::from_millis(1250);
 const MEMPOOL_TILE_HEIGHT: u16 = 5;
 const MARKETPLACE_TILE_HEIGHT: u16 = 5;
 const LOG_REFRESH_MILLISECONDS: u64 = 750;
@@ -279,6 +279,8 @@ struct DashboardState {
     selected_transaction: usize,
     transactions_focused: bool,
     loading_older_since: Option<Instant>,
+    /// Earlier dashboard pages verified by walking from an accepted block.
+    linked_history: HashSet<BlockHash>,
     has_more: bool,
     older_retry_after: Option<Instant>,
     older_error: Option<String>,
@@ -293,6 +295,7 @@ impl Default for DashboardState {
             selected_transaction: 0,
             transactions_focused: false,
             loading_older_since: None,
+            linked_history: HashSet::new(),
             has_more: true,
             older_retry_after: None,
             older_error: None,
@@ -444,10 +447,24 @@ struct MempoolState {
     previews: HashMap<Txid, TransactionSummary>,
     total_bytes: u64,
     selected: usize,
-    loading: bool,
+    loading_since: Option<Instant>,
     bulk_pending: bool,
+    zmq_seen: u64,
+    needs_refresh: bool,
     last_refresh: Option<Instant>,
+    follow_up_at: Option<Instant>,
     error: Option<String>,
+}
+
+impl MempoolState {
+    fn refresh_due(&self, hint: crate::zmq::Signal, full: bool, polling_seconds: u64) -> bool {
+        full || self.needs_refresh
+            || (hint.ready && hint.version != self.zmq_seen)
+            || self.follow_up_at.is_some_and(|at| at <= Instant::now())
+            || self.last_refresh.is_none_or(|last| {
+                !hint.connected && last.elapsed() >= Duration::from_secs(polling_seconds)
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -488,6 +505,7 @@ struct AppState {
     unmask_identity_addresses: bool,
     notice: Option<TransientNotice>,
     clipboard_busy: bool,
+    zmq_copy_feedback: Option<(source_ui::zmq_setup::CopyStatus, Instant)>,
     save_prompt: Option<SavePrompt>,
     cache_clear_prompt: Option<CacheClearPrompt>,
     cache_size_bytes: Option<u64>,
@@ -701,11 +719,18 @@ enum AppEvent {
     },
     Observation(RpcObservation),
     DashboardRefresh(Result<DashboardSnapshot, String>),
+    LiveDashboard {
+        branch: Result<Arc<crate::chain_state::PreparedBranch>, String>,
+        snapshot: Result<DashboardSnapshot, String>,
+    },
     DashboardPage {
         started: Instant,
         result: Result<Vec<BlockRecord>, String>,
     },
-    MempoolRefresh(Result<MempoolSnapshot, String>),
+    MempoolRefresh {
+        started: Instant,
+        result: Result<MempoolSnapshot, String>,
+    },
     IdentityOffers {
         identity: String,
         result: Result<Vec<MarketplaceOffer>, String>,
@@ -915,6 +940,21 @@ impl ObjectStore {
                 let Some(raw_json) = tx.raw.clone() else {
                     continue;
                 };
+                if raw_json["decodedBy"] == "ZMQ"
+                    && let Some(known) = self.transaction(&tx.txid)
+                    && known.raw_json["decodedBy"] != "ZMQ"
+                {
+                    let mut known = known.clone();
+                    known.block_hash = Some(hash.clone());
+                    known.block_height = Some(block.summary.height);
+                    known.block_time = block.summary.time;
+                    known.raw_json["blockhash"] = json!(hash);
+                    known.raw_json["height"] = json!(block.summary.height);
+                    known.raw_json["blocktime"] = json!(block.summary.time);
+                    known.summary.raw = Some(known.raw_json.clone());
+                    self.replace_transaction(known);
+                    continue;
+                }
                 self.replace_transaction(TransactionRecord {
                     source_id: None,
                     summary: tx.clone(),
@@ -1431,6 +1471,11 @@ pub fn run(
             )?;
         }
     }
+    let survey = crate::zmq::setup::Survey::read(crate::zmq::setup::known_paths(
+        &registry.configs,
+        &registry.settings_path,
+    ));
+    source_ui::zmq_setup::apply(&survey, &registry.configs);
     let runtime_context = runtime.enter();
     let route = classify_start_object(start_object.as_deref());
     let mut sessions = vec![create_session(
@@ -1581,6 +1626,7 @@ fn create_session(
             }
         }
     });
+    crate::zmq::spawn(config.clone(), tx.clone());
     spawn_dashboard_poller(config.clone(), tx.clone());
     let geoip_directory = geoip::database_directory(&config.cache_path);
     let geoip_status = geoip::status(&geoip_directory);
@@ -1634,6 +1680,7 @@ fn create_session(
         unmask_identity_addresses: false,
         notice: None,
         clipboard_busy: false,
+        zmq_copy_feedback: None,
         save_prompt: None,
         cache_clear_prompt: None,
         cache_size_bytes: cache_disk_usage(&config.cache_path).ok(),
@@ -1770,6 +1817,8 @@ fn spawn_dashboard_poller(mut config: Config, tx: UnboundedSender<AppEvent>) {
         let mut failures = 0u32;
         let mut reconciler = None;
         let mut published: Option<Arc<crate::chain_state::PreparedBranch>> = None;
+        let mut covered = HashSet::new();
+        let mut covered_generation = None;
         loop {
             if !config.daemon.control.polling() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1779,6 +1828,7 @@ fn spawn_dashboard_poller(mut config: Config, tx: UnboundedSender<AppEvent>) {
                 continue;
             }
             let started = Instant::now();
+            let signal = config.daemon.control.zmq.chain_signal();
             let generation = config.daemon.control.generation();
             if reconciler.is_none() {
                 reconciler = crate::reconciliation::Reconciler::new(config.clone())
@@ -1834,15 +1884,39 @@ fn spawn_dashboard_poller(mut config: Config, tx: UnboundedSender<AppEvent>) {
                 }
                 Err(error) => Err(error),
             };
-            let _ = tx.send(AppEvent::Guarded {
-                control: config.daemon.control.clone(),
-                generation,
-                event: Box::new(AppEvent::Reconciled(reconciled)),
-            });
-            let result = load_dashboard_snapshot(&config)
-                .await
-                .map_err(|error| error.to_string());
+            if covered_generation != Some(generation) {
+                covered.clear();
+                covered_generation = Some(generation);
+            }
+            let result = load_dashboard_snapshot_for_branch(
+                &config,
+                reconciled.as_ref().ok().map(AsRef::as_ref),
+                &covered,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            if let Ok(snapshot) = &result {
+                covered.extend(
+                    snapshot
+                        .blocks
+                        .iter()
+                        .map(|block| block.summary.hash.clone()),
+                );
+                if let Some(tip) = reconciled.as_ref().ok().and_then(|branch| branch.tip()) {
+                    let oldest = tip.height.saturating_sub(DASHBOARD_BLOCK_COUNT - 1);
+                    let branch = reconciled.as_ref().unwrap();
+                    let recent = branch
+                        .canonical
+                        .range(oldest..=tip.height)
+                        .map(|(_, header)| header.hash.as_str())
+                        .collect::<HashSet<_>>();
+                    covered.retain(|hash| recent.contains(hash.as_str()));
+                } else {
+                    covered.clear();
+                }
+            }
 
+            let reconciled_ok = reconciled.is_ok();
             failures = if result.is_ok() {
                 0
             } else {
@@ -1852,22 +1926,51 @@ fn spawn_dashboard_poller(mut config: Config, tx: UnboundedSender<AppEvent>) {
                 .send(AppEvent::Guarded {
                     control: config.daemon.control.clone(),
                     generation,
-                    event: Box::new(AppEvent::DashboardRefresh(result)),
+                    event: Box::new(AppEvent::LiveDashboard {
+                        branch: reconciled,
+                        snapshot: result,
+                    }),
                 })
                 .is_err()
             {
                 break;
             }
 
-            let interval = Duration::from_secs(
-                config
-                    .poll_interval_seconds
-                    .saturating_mul(1u64 << failures.min(6))
-                    .min(120),
-            );
-            let elapsed = started.elapsed();
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
+            let hub = &config.daemon.control.zmq;
+            let quiet_interval = config.poll_interval_seconds.max(30);
+            let fallback_interval = config
+                .poll_interval_seconds
+                .saturating_mul(1u64 << failures.min(6))
+                .min(120);
+            let seconds = if signal.connected && reconciled_ok && failures == 0 {
+                quiet_interval
+            } else {
+                fallback_interval
+            };
+            let deadline = started + Duration::from_secs(seconds);
+            loop {
+                let changed = hub.chain_signal().version != signal.version;
+                if changed
+                    || tokio::time::Instant::now() >= deadline
+                    || !config.daemon.control.accepts(generation)
+                {
+                    break;
+                }
+                let wake = hub.chain_wake.notified();
+                tokio::pin!(wake);
+                wake.as_mut().enable();
+                if hub.chain_signal().version != signal.version {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut wake => {}
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = tx.closed() => return,
+                }
+            }
+            // Avoid issuing a stack of RPC calls for a hash/raw pair or a busy sync.
+            if hub.chain_signal().version != signal.version {
+                tokio::time::sleep(Duration::from_millis(40)).await;
             }
         }
     });
@@ -1949,14 +2052,30 @@ fn invalidate_reorg_views(state: &mut AppState) {
     state.marketplace.loading = false;
     state.marketplace.refresh_requested = true;
     state.marketplace.error = Some("Branch changed; awaiting refreshed offers".into());
-    state.mempool.loading = false;
+    state.mempool.loading_since = None;
     state.mempool.last_refresh = None;
+    state.mempool.follow_up_at = None;
     state.dashboard.loading_older_since = None;
     let selected_hash = state.dashboard.selected_block_hash().cloned();
+    let fork_height = state.store.chain.reconciled.as_ref().and_then(|branch| {
+        branch
+            .changed_hashes
+            .iter()
+            .filter_map(|hash| branch.detached.get(hash).map(|h| h.height))
+            .min()
+    });
+    state.dashboard.recent_blocks.retain(|id| {
+        state.store.chain.confirmations(id).is_some()
+            || (state.dashboard.linked_history.contains(id)
+                && fork_height
+                    .zip(state.store.block(id))
+                    .is_some_and(|(fork, block)| block.summary.height < fork))
+    });
+    let visible = state.dashboard.recent_blocks.iter().collect::<HashSet<_>>();
     state
         .dashboard
-        .recent_blocks
-        .retain(|id| state.store.chain.confirmations(id).is_some());
+        .linked_history
+        .retain(|hash| visible.contains(hash));
     state.dashboard.restore_block_selection(selected_hash);
 }
 
@@ -1964,11 +2083,12 @@ fn spawn_dashboard_page_loader(
     config: Config,
     tx: UnboundedSender<AppEvent>,
     newest_height: u64,
+    parent: Option<BlockHash>,
     started: Instant,
 ) {
     let tx = revision_sender(&config, tx);
     tokio::spawn(async move {
-        let result = load_dashboard_page(&config, newest_height)
+        let result = load_dashboard_page(&config, newest_height, parent)
             .await
             .map_err(|error| error.to_string());
         let _ = tx.send(AppEvent::DashboardPage { started, result });
@@ -2350,21 +2470,41 @@ fn spawn_peer_loader(config: Config, tx: UnboundedSender<AppEvent>, snapshot: bo
     });
 }
 
-fn spawn_mempool_loader(config: Config, tx: UnboundedSender<AppEvent>, full: bool) {
+fn spawn_mempool_loader(
+    mut config: Config,
+    tx: UnboundedSender<AppEvent>,
+    full: bool,
+    started: Instant,
+) {
+    config.daemon.api_pool = Arc::default();
     let tx = revision_sender(&config, tx);
     let generation = config.daemon.control.generation();
     tokio::spawn(async move {
         let result = async {
             let client = RpcClient::for_config(&config)?;
             let output = client.get_raw_mempool_verbose(full).await?;
-            Ok(parse_mempool_snapshot(output.result))
+            let mut snapshot = parse_mempool_snapshot(output.result);
+            for entry in &snapshot.entries {
+                if !snapshot.previews.contains_key(&entry.txid)
+                    && let Some(raw) = config.daemon.control.zmq.transaction(&entry.txid)
+                {
+                    snapshot.previews.insert(
+                        entry.txid.clone(),
+                        TransactionSummary {
+                            txid: entry.txid.clone(),
+                            raw: Some((*raw).clone()),
+                        },
+                    );
+                }
+            }
+            Ok(snapshot)
         }
         .await
         .map_err(|error: anyhow::Error| error.to_string());
         let _ = tx.send(AppEvent::Guarded {
             control: config.daemon.control.clone(),
             generation,
-            event: Box::new(AppEvent::MempoolRefresh(result)),
+            event: Box::new(AppEvent::MempoolRefresh { started, result }),
         });
     });
 }
@@ -2660,6 +2800,14 @@ async fn resolve_hash(config: &Config, hash: &str) -> Result<SearchResolution> {
 }
 
 async fn load_dashboard_snapshot(config: &Config) -> Result<DashboardSnapshot> {
+    load_dashboard_snapshot_for_branch(config, None, &HashSet::new()).await
+}
+
+async fn load_dashboard_snapshot_for_branch(
+    config: &Config,
+    branch: Option<&crate::chain_state::PreparedBranch>,
+    covered: &HashSet<BlockHash>,
+) -> Result<DashboardSnapshot> {
     let client = RpcClient::for_config(config)?;
     let info = client.get_info().await.context("failed to call getinfo")?;
     if info.result.get("chainid").is_some() {
@@ -2669,7 +2817,9 @@ async fn load_dashboard_snapshot(config: &Config) -> Result<DashboardSnapshot> {
     let newest = rpc_u64_field(&info.result, "blocks")
         .or_else(|| rpc_u64_field(&info.result, "height"))
         .or_else(|| rpc_u64_field(&info.result, "blockheight"));
-    let newest = if let Some(newest) = newest {
+    let newest = if let Some(tip) = branch.and_then(|branch| branch.tip()) {
+        tip.height
+    } else if let Some(newest) = newest {
         newest
     } else {
         let tip = client
@@ -2690,7 +2840,19 @@ async fn load_dashboard_snapshot(config: &Config) -> Result<DashboardSnapshot> {
             .visible
             .load(std::sync::atomic::Ordering::Acquire)
     }) {
-        let block = if height == newest {
+        if branch
+            .and_then(|branch| branch.canonical.get(&height))
+            .is_some_and(|header| covered.contains(&header.hash))
+        {
+            continue;
+        }
+        let block = if let Some(header) = branch.and_then(|branch| branch.canonical.get(&height)) {
+            if let Some(raw) = raw_dashboard_block(config, &client, header).await {
+                Ok(raw)
+            } else {
+                load_block_summary(config, BlockId::Hash(header.hash.clone())).await
+            }
+        } else if height == newest {
             fetch_block_summary(config, BlockId::Height(height)).await
         } else {
             load_block_summary(config, BlockId::Height(height)).await
@@ -2718,16 +2880,106 @@ async fn load_dashboard_snapshot(config: &Config) -> Result<DashboardSnapshot> {
     })
 }
 
-async fn load_dashboard_page(config: &Config, newest_height: u64) -> Result<Vec<BlockRecord>> {
-    let config = &config.noninteractive();
+async fn raw_dashboard_block(
+    config: &Config,
+    client: &RpcClient,
+    header: &crate::reconciliation::Header,
+) -> Option<BlockRecord> {
+    let hub = &config.daemon.control.zmq;
+    // Check the parent before requesting the exact header. This avoids an RPC for
+    // every cached dashboard row when the publisher supplied only the newest body.
+    if !hub.has_block_for_parent(header.parent.as_deref()) {
+        return None;
+    }
+    let params = json!([header.hash]).to_string();
+    let info = if let Some(info) = cached_local_rpc_result(config, "getblockheader", &params)
+        .await
+        .ok()
+        .flatten()
+    {
+        info
+    } else {
+        client
+            .call_local("getblockheader", &[json!(header.hash)])
+            .await
+            .ok()?
+    };
+    if info["hash"].as_str() != Some(header.hash.as_str()) {
+        return None;
+    }
+    let (mut transactions, size, version, solution) = if let Some(body) = hub.block(&info, None) {
+        body
+    } else {
+        let serialized = client
+            .call_local("getblockheader", &[json!(header.hash), json!(false)])
+            .await
+            .ok()?;
+        hub.block(&info, Some(serialized.as_str()?))?
+    };
+    for tx in &mut transactions {
+        tx["blockhash"] = json!(header.hash);
+        tx["height"] = json!(header.height);
+        tx["blocktime"] = json!(header.time);
+    }
+    let mut raw = json!({
+        "hash": header.hash, "height": header.height, "time": header.time, "size": size,
+        "previousblockhash": header.parent, "version": version, "solution": solution,
+        "blocktype": match info["validationtype"].as_str() {
+            Some("stake") => Some("staked"),
+            Some("work") => Some("mined"),
+            _ => None,
+        },
+        "tx": transactions, "decodedBy": "ZMQ",
+    });
+    if let Some(fields) = info.as_object() {
+        for (key, value) in fields {
+            if raw.get(key).is_none() {
+                raw[key] = value.clone();
+            }
+        }
+    }
+    let summary = serde_json::from_value(raw.clone()).ok()?;
+    Some(BlockRecord {
+        prepared_transactions: prepare_embedded_transactions(&summary),
+        summary,
+        raw_json: raw,
+        detail_loaded: false,
+    })
+}
+
+async fn load_dashboard_page(
+    config: &Config,
+    newest_height: u64,
+    mut parent: Option<BlockHash>,
+) -> Result<Vec<BlockRecord>> {
+    let mut config = config.noninteractive();
+    if parent.is_some() {
+        config.daemon.api_pool = Arc::default();
+    }
     let oldest_height = newest_height.saturating_sub(DASHBOARD_BLOCK_COUNT - 1);
     let mut blocks = Vec::new();
+    let linked = parent.is_some();
     for height in (oldest_height..=newest_height).rev() {
-        blocks.push(
-            load_block_summary(config, BlockId::Height(height))
-                .await
-                .with_context(|| format!("failed to load dashboard block at height {height}"))?,
+        let target = match parent.take() {
+            Some(hash) => BlockId::Hash(hash),
+            None if !linked => BlockId::Height(height),
+            None => anyhow::bail!("Dashboard parent link missing at {height}"),
+        };
+        let block = load_block_summary(&config, target.clone())
+            .await
+            .with_context(|| format!("failed to load dashboard block at height {height}"))?;
+        anyhow::ensure!(
+            block.summary.height == height
+                && match target {
+                    BlockId::Hash(hash) => block.summary.hash == hash,
+                    BlockId::Height(_) => true,
+                },
+            "Dashboard parent did not match requested block at {height}"
         );
+        if linked {
+            parent = block.summary.previousblockhash.clone();
+        }
+        blocks.push(block);
     }
     Ok(blocks)
 }
@@ -3777,6 +4029,7 @@ fn run_loop(
     let mut consent: Option<api_permission_ui::Prompt> = None;
     let mut source_message = String::new();
     let mut source_activity = source_ui::Activity::default();
+    let mut zmq_setup: Option<(usize, source_ui::zmq_setup::Modal)> = None;
     let mut redraw = true;
     let mut last_periodic_draw = Instant::now();
     let mut pending_input = None;
@@ -3809,6 +4062,8 @@ fn run_loop(
                 false
             } else if bookmarks.open || bookmarks.editing() {
                 bookmarks.editing()
+            } else if let Some((_, modal)) = &zmq_setup {
+                modal.editing
             } else if sources_open {
                 false
             } else if let Some(panel) = &defi {
@@ -3860,6 +4115,11 @@ fn run_loop(
                 continue;
             }
             if let Event::Paste(text) = event {
+                if let Some((_, modal)) = &mut zmq_setup
+                    && consent.is_none()
+                {
+                    modal.paste(&text);
+                }
                 if consent.is_none()
                     && local_permission.is_none()
                     && !sources_open
@@ -3886,10 +4146,22 @@ fn run_loop(
                     == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
                 && mouse.modifiers.is_empty()
             {
-                let target = theme
-                    .copy_values
-                    .borrow_mut()
-                    .select(ratatui::layout::Position::new(mouse.column, mouse.row));
+                let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+                if let Some((_, modal)) = &zmq_setup {
+                    if consent.is_none()
+                        && let Some(lines) = modal.copy_at(position)
+                    {
+                        request_clipboard_copy(
+                            state,
+                            &tx,
+                            source_ui::zmq_setup::CLIPBOARD_LABEL.into(),
+                            lines,
+                        );
+                        redraw = true;
+                    }
+                    continue;
+                }
+                let target = theme.copy_values.borrow_mut().select(position);
                 if let Some(target) = target {
                     copy_clicked_value(state, &tx, target);
                     redraw = true;
@@ -3913,6 +4185,29 @@ fn run_loop(
                     && let Some(prompt) = consent.take()
                 {
                     let _ = prompt.reply.send(decision);
+                }
+                continue;
+            }
+            if let Some((_, modal)) = &mut zmq_setup {
+                if key.code == KeyCode::Char('M') && !modal.editing {
+                    mouse_capture = !mouse_capture;
+                    input::set_mouse_capture(terminal.backend_mut(), mouse_capture)?;
+                    continue;
+                }
+                if !modal.editing && matches!(key.code, KeyCode::Char('p' | 'r')) {
+                    state.zmq_copy_feedback = None;
+                }
+                let (close, copy) = modal.key(key.code, registry);
+                if close {
+                    zmq_setup = None;
+                }
+                if let Some(lines) = copy {
+                    request_clipboard_copy(
+                        state,
+                        &tx,
+                        source_ui::zmq_setup::CLIPBOARD_LABEL.into(),
+                        lines,
+                    );
                 }
                 continue;
             }
@@ -4296,6 +4591,14 @@ fn run_loop(
                             ConnectionState::Disabled
                         });
                         source_message = "Session change; s saves connection states".into();
+                    }
+                    KeyCode::Char('z') if api_index.is_none() => {
+                        state.zmq_copy_feedback = None;
+                        zmq_setup = source_ui::zmq_setup::Modal::open(chain_index, registry)
+                            .map(|modal| (chain_index, modal));
+                        if zmq_setup.is_none() {
+                            source_message = "ZMQ Setup requires a local daemon config file".into();
+                        }
                     }
                     KeyCode::Char('m') if api_index.is_none() => {
                         if control.state() != ConnectionState::Disabled {
@@ -5087,6 +5390,12 @@ fn run_loop(
                 KeyCode::Up | KeyCode::Char('k') if matches!(state.screen, Screen::Marketplace) => {
                     select_previous_marketplace_offer(state);
                 }
+                KeyCode::F(5)
+                    if matches!(state.screen, Screen::Dashboard)
+                        && config.daemon.control.zmq.chain_signal().connected =>
+                {
+                    config.daemon.control.zmq.refresh_chain();
+                }
                 KeyCode::F(5) if matches!(state.screen, Screen::Dashboard) => {
                     let config = config.clone();
                     let tx = tx.clone();
@@ -5096,6 +5405,9 @@ fn run_loop(
                             .map_err(|e| e.to_string());
                         let _ = tx.send(AppEvent::DashboardRefresh(result));
                     });
+                }
+                KeyCode::F(5) if matches!(state.screen, Screen::Mempool) => {
+                    state.mempool.needs_refresh = true;
                 }
                 KeyCode::F(5) if matches!(state.screen, Screen::Marketplace) => {
                     state.marketplace.refresh_requested = true;
@@ -5739,17 +6051,16 @@ fn run_loop(
                 let session = &mut sessions[index];
                 if session.config.daemon.control.state()
                     == crate::sources::ConnectionState::Monitored
-                    && !session.state.mempool.loading
-                    && session
-                        .state
-                        .mempool
-                        .last_refresh
-                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
                 {
-                    session.state.mempool.loading = true;
                     let mut background = session.config.clone();
                     background.daemon.background = true;
-                    spawn_mempool_loader(background, session.tx.clone(), false);
+                    refresh_mempool(
+                        &mut session.state.mempool,
+                        &background,
+                        &session.tx,
+                        false,
+                        5,
+                    );
                 }
                 redraw |= drain_app_events_until(
                     &mut session.state,
@@ -5909,6 +6220,8 @@ fn run_loop(
         let config = &session.config;
         let state = &mut session.state;
         let tx = session.tx.clone();
+        let size = terminal.size()?;
+        let body = main_layout(state, theme, size.into(), mouse_capture)[3];
 
         if !foreground_turn {
             request_chain_identity_names(state, config, &tx, chain_name_requests);
@@ -5971,7 +6284,7 @@ fn run_loop(
                     registration_payments::request(state, config, &tx, &txid);
                 }
                 request_dashboard_page_if_needed(state, config, &tx);
-                request_mempool_transaction_hydration(state, config, &tx);
+                request_mempool_transaction_hydration(state, config, &tx, body.height);
                 request_currency_definitions(state, config, &tx);
                 if let Some(report) = defi.as_ref().and_then(|panel| panel.report.as_ref()) {
                     let ids = report
@@ -6005,11 +6318,12 @@ fn run_loop(
             }
         }
 
-        let size = terminal.size()?;
-        let body = main_layout(state, theme, size.into(), mouse_capture)[3];
         redraw |= notarization_ui::drive(state, config, &registry.configs, &tx, body.height);
         if sources_open {
             redraw |= source_activity.poll(&config.cache_path);
+            if let Some((_, modal)) = &mut zmq_setup {
+                redraw |= modal.poll(registry);
+            }
         }
         if !foreground_turn && event::poll(Duration::ZERO)? {
             pending_input = Some(read_terminal_event(&timing)?);
@@ -6124,6 +6438,20 @@ fn run_loop(
                         &source_message,
                         &mut source_activity,
                     );
+                    if let Some((index, modal)) = &mut zmq_setup {
+                        let copy_status = state
+                            .zmq_copy_feedback
+                            .filter(|(_, until)| *until > Instant::now())
+                            .map(|(status, _)| status);
+                        modal.render(
+                            frame,
+                            theme,
+                            registry,
+                            &source_names[*index],
+                            mouse_capture,
+                            copy_status,
+                        );
+                    }
                 }
                 if bookmarks.open {
                     bookmarks.render(
@@ -6230,16 +6558,15 @@ fn request_dashboard_page_if_needed(
         return;
     }
 
-    let Some(oldest_height) = state
+    let Some(oldest) = state
         .dashboard
         .recent_blocks
         .last()
         .and_then(|hash| state.store.block(hash))
-        .map(|block| block.summary.height)
     else {
         return;
     };
-    let Some(next_height) = oldest_height.checked_sub(1) else {
+    let Some(next_height) = oldest.summary.height.checked_sub(1) else {
         state.dashboard.has_more = false;
         return;
     };
@@ -6247,7 +6574,13 @@ fn request_dashboard_page_if_needed(
     let started = Instant::now();
     state.dashboard.loading_older_since = Some(started);
     state.dashboard.older_error = None;
-    spawn_dashboard_page_loader(config.clone(), tx.clone(), next_height, started);
+    let parent = state
+        .store
+        .chain
+        .reconciled
+        .as_ref()
+        .and(oldest.summary.previousblockhash.clone());
+    spawn_dashboard_page_loader(config.clone(), tx.clone(), next_height, parent, started);
 }
 
 fn dashboard_should_load_older(dashboard: &DashboardState) -> bool {
@@ -6264,17 +6597,17 @@ fn request_mempool_transaction_hydration(
     state: &mut AppState,
     config: &Config,
     tx: &UnboundedSender<AppEvent>,
+    body_height: u16,
 ) {
     if !matches!(state.screen, Screen::Mempool)
         || state.mempool.bulk_pending
-        || state.mempool.loading
+        || state.mempool.loading_since.is_some()
         || !state.loading_transactions.is_empty()
     {
         return;
     }
-    let candidates = state
-        .mempool
-        .entries
+    let visible = mempool_visible_range(&state.mempool, body_height.saturating_sub(5));
+    let candidates = state.mempool.entries[visible]
         .iter()
         .filter(|entry| !state.mempool.previews.contains_key(&entry.txid))
         .map(|entry| entry.txid.clone())
@@ -6647,21 +6980,47 @@ fn request_mempool_refresh_if_needed(
         }),
         _ => false,
     };
-    if state.auxiliary.is_some() || !needs_membership || state.mempool.loading {
+    if state.auxiliary.is_some() || !needs_membership || state.mempool.loading_since.is_some() {
         return;
     }
     let full = matches!(state.screen, Screen::Mempool) && state.mempool.bulk_pending;
-    let due = full
-        || state
-            .mempool
-            .last_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(MEMPOOL_REFRESH_SECONDS));
-    if due {
-        if full {
-            state.mempool.bulk_pending = false;
-        }
-        state.mempool.loading = true;
-        spawn_mempool_loader(config.clone(), tx.clone(), full);
+    refresh_mempool(
+        &mut state.mempool,
+        config,
+        tx,
+        full,
+        MEMPOOL_REFRESH_SECONDS,
+    );
+}
+
+fn refresh_mempool(
+    mempool: &mut MempoolState,
+    config: &Config,
+    tx: &UnboundedSender<AppEvent>,
+    full: bool,
+    polling_seconds: u64,
+) {
+    if mempool.loading_since.is_some() {
+        return;
+    }
+    let (hint, last_event) = config.daemon.control.zmq.mempool_signal(mempool.zmq_seen);
+    if mempool.refresh_due(hint, full, polling_seconds) {
+        let started = Instant::now();
+        // An immediate snapshot handles the notification. A single follow-up
+        // covers admissions in the next daemon notification batch.
+        mempool.follow_up_at = if hint.connected && hint.version != mempool.zmq_seen {
+            last_event
+                .map(Instant::from_std)
+                .map(|at| at + MEMPOOL_NOTIFICATION_FOLLOW_UP)
+                .filter(|&at| at > started)
+        } else {
+            None
+        };
+        mempool.needs_refresh = false;
+        mempool.bulk_pending &= !full;
+        mempool.loading_since = Some(started);
+        mempool.zmq_seen = hint.version;
+        spawn_mempool_loader(config.clone(), tx.clone(), full && !hint.connected, started);
     }
 }
 
@@ -7202,7 +7561,7 @@ fn background_stage(event: &AppEvent) -> &'static str {
         AppEvent::Guarded { event, .. } | AppEvent::RevisionGuarded { event, .. } => {
             background_stage(event)
         }
-        AppEvent::Reconciled(_) => "reconciliation",
+        AppEvent::Reconciled(_) | AppEvent::LiveDashboard { .. } => "reconciliation",
         AppEvent::Transactions { .. } | AppEvent::TransactionRefresh { .. } => "transaction_update",
         AppEvent::Observation(_) => "daemon_observation",
         AppEvent::IdentityDetail { .. } | AppEvent::IdentityEvidence { .. } => "identity_update",
@@ -7219,6 +7578,7 @@ fn can_change_flow_links(event: &AppEvent) -> bool {
         | AppEvent::Transactions { .. }
         | AppEvent::TransactionRefresh { .. }
         | AppEvent::DashboardRefresh(_)
+        | AppEvent::LiveDashboard { .. }
         | AppEvent::DashboardPage { .. }
         | AppEvent::IdentityDetail { .. }
         | AppEvent::IdentityEvidence { .. }
@@ -7331,6 +7691,12 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                 apply_app_event(state, *event);
             } else {
                 match *event {
+                    AppEvent::MempoolRefresh { started, .. }
+                        if state.mempool.loading_since == Some(started) =>
+                    {
+                        state.mempool.loading_since = None;
+                        state.mempool.needs_refresh = true;
+                    }
                     AppEvent::DashboardPage { started, .. }
                         if state.dashboard.loading_older_since == Some(started) =>
                     {
@@ -7352,6 +7718,7 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
         }
         AppEvent::Reconciled(Ok(branch)) => {
             let previous = state.store.chain.reconciled.as_ref();
+            let tip_changed = previous.and_then(|current| current.tip()) != branch.tip();
             let unchanged = previous.is_some_and(|current| Arc::ptr_eq(current, &branch));
             let incremental = previous.is_some_and(|current| {
                 current.tip().is_some()
@@ -7366,6 +7733,7 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
             state
                 .store
                 .project_transaction_inclusions(&branch, incremental);
+            state.mempool.needs_refresh |= tip_changed;
             if reorg {
                 invalidate_reorg_views(state);
                 rebuild_dashboard_transactions(state);
@@ -7395,7 +7763,12 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                 apply_app_event(state, *event);
             } else {
                 match *event {
-                    AppEvent::MempoolRefresh(_) => state.mempool.loading = false,
+                    AppEvent::MempoolRefresh { started, .. }
+                        if state.mempool.loading_since == Some(started) =>
+                    {
+                        state.mempool.loading_since = None;
+                        state.mempool.needs_refresh = true;
+                    }
                     AppEvent::Peers(_) => {
                         state.peers.loading = false;
                         state.peers.controls.refresh_after_action = false;
@@ -7422,6 +7795,10 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                 .last_block_time
                 .or(state.tip.last_block_time);
             state.tip.healthy = state.store.chain.online;
+        }
+        AppEvent::LiveDashboard { branch, snapshot } => {
+            apply_app_event(state, AppEvent::Reconciled(branch));
+            apply_app_event(state, AppEvent::DashboardRefresh(snapshot));
         }
         AppEvent::DashboardRefresh(Ok(snapshot)) => {
             state.tip = snapshot.tip;
@@ -7459,6 +7836,28 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                     state.dashboard.has_more = !blocks.is_empty() && !reached_genesis;
                     state.dashboard.older_retry_after = None;
                     state.dashboard.older_error = None;
+                    if let Some(mut parent) = state
+                        .dashboard
+                        .recent_blocks
+                        .last()
+                        .and_then(|hash| state.store.block(hash))
+                        .and_then(|block| block.summary.previousblockhash.as_deref())
+                        && state.store.chain.reconciled.is_some()
+                    {
+                        for block in &blocks {
+                            if block.summary.hash != parent {
+                                break;
+                            }
+                            state
+                                .dashboard
+                                .linked_history
+                                .insert(block.summary.hash.clone());
+                            let Some(previous) = block.summary.previousblockhash.as_deref() else {
+                                break;
+                            };
+                            parent = previous;
+                        }
+                    }
                     merge_dashboard_blocks(state, blocks);
                 }
                 Err(error) => {
@@ -7472,11 +7871,22 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                 }
             }
         }
-        AppEvent::MempoolRefresh(result) => {
-            state.mempool.loading = false;
+        AppEvent::MempoolRefresh { started, result } => {
+            if state.mempool.loading_since != Some(started) {
+                return;
+            }
+            state.mempool.loading_since = None;
             state.mempool.last_refresh = Some(Instant::now());
             match result {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    snapshot.entries.retain(|entry| {
+                        state
+                            .store
+                            .transaction(&entry.txid)
+                            .and_then(|tx| tx.block_hash.as_deref())
+                            .is_none_or(|hash| state.store.chain.confirmations(hash).is_none())
+                    });
+                    snapshot.total_bytes = snapshot.entries.iter().map(|entry| entry.size).sum();
                     let selected_txid = state
                         .mempool
                         .entries
@@ -7496,7 +7906,12 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
                             state.store.learn_currency_data(raw);
                         }
                     }
-                    state.mempool.previews.extend(snapshot.previews);
+                    state.mempool.previews.extend(
+                        snapshot
+                            .previews
+                            .into_iter()
+                            .filter(|(txid, _)| members.contains(txid.as_str())),
+                    );
                     state.mempool.entries = snapshot.entries;
                     state.mempool.total_bytes = snapshot.total_bytes;
                     state.mempool.selected = selected_txid
@@ -8066,9 +8481,17 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
             result,
         } => {
             state.clipboard_busy = false;
-            let message = match result
-                .and_then(|prepared| prepared.finish().map_err(|error| error.to_string()))
-            {
+            let result =
+                result.and_then(|prepared| prepared.finish().map_err(|error| error.to_string()));
+            if label == source_ui::zmq_setup::CLIPBOARD_LABEL && state.zmq_copy_feedback.is_some() {
+                let status = if result.is_ok() {
+                    source_ui::zmq_setup::CopyStatus::Copied
+                } else {
+                    source_ui::zmq_setup::CopyStatus::Failed
+                };
+                state.zmq_copy_feedback = Some((status, Instant::now() + Duration::from_secs(3)));
+            }
+            let message = match result {
                 Ok(route) => format!("Sent {label} ({bytes} bytes) via {route}; paste to verify"),
                 Err(error) => format!("Copy failed: {error}"),
             };
@@ -8114,6 +8537,9 @@ fn apply_app_event(state: &mut AppState, app_event: AppEvent) {
 }
 
 fn merge_dashboard_blocks(state: &mut AppState, blocks: Vec<BlockRecord>) {
+    if blocks.is_empty() {
+        return;
+    }
     let selected_hash = state.dashboard.selected_block_hash().cloned();
     let mut hashes_by_height = state
         .dashboard
@@ -8126,13 +8552,51 @@ fn merge_dashboard_blocks(state: &mut AppState, blocks: Vec<BlockRecord>) {
                 .map(|block| (block.summary.height, hash.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let mut confirmed = HashSet::new();
     for block in blocks {
         let height = block.summary.height;
         let hash = state.store.insert_block(block);
         if state.store.chain.reconciled.is_none()
             || state.store.block_hash_at_height(height) == Some(&hash)
+            || state.dashboard.linked_history.contains(&hash)
         {
+            if let Some(block) = state.store.block(&hash) {
+                for tx in &block.summary.tx {
+                    confirmed.insert(tx.txid.clone());
+                }
+            }
             hashes_by_height.insert(height, hash);
+        }
+    }
+    if !confirmed.is_empty() {
+        state.store.chain.remove_confirmed_from_mempool(&confirmed);
+    }
+    if !confirmed.is_empty() && !state.mempool.entries.is_empty() {
+        let selected = state
+            .mempool
+            .entries
+            .get(state.mempool.selected)
+            .map(|entry| entry.txid.clone());
+        let count = state.mempool.entries.len();
+        state
+            .mempool
+            .entries
+            .retain(|entry| !confirmed.contains(&entry.txid));
+        state
+            .mempool
+            .previews
+            .retain(|txid, _| !confirmed.contains(txid));
+        if state.mempool.entries.len() != count {
+            state.mempool.total_bytes = state.mempool.entries.iter().map(|entry| entry.size).sum();
+            state.mempool.selected = selected
+                .and_then(|id| {
+                    state
+                        .mempool
+                        .entries
+                        .iter()
+                        .position(|entry| entry.txid == id)
+                })
+                .unwrap_or(0);
         }
     }
     state.dashboard.recent_blocks = hashes_by_height
@@ -8149,15 +8613,19 @@ fn rebuild_dashboard_transactions(state: &mut AppState) {
     let selected = dashboard
         .recent_transactions
         .get(dashboard.selected_transaction)
-        .filter(|_| dashboard.selected_transaction != 0)
-        .map(|entry| entry.txid.clone());
-    let mut seen = HashSet::new();
+        .filter(|_| dashboard.transactions_focused || dashboard.selected_transaction != 0)
+        .map(|entry| (entry.block.clone(), entry.txid.clone()));
     dashboard.recent_transactions = dashboard
         .recent_blocks
         .iter()
         .filter_map(|hash| state.store.block(hash))
         .filter(|block| {
-            state.store.chain.block_badge(&block.summary.hash) != Some(StatusBadge::Orphaned)
+            if let Some(branch) = &state.store.chain.reconciled {
+                branch.canonical_block(&block.summary.hash).is_some()
+                    || dashboard.linked_history.contains(&block.summary.hash)
+            } else {
+                state.store.chain.block_badge(&block.summary.hash) != Some(StatusBadge::Orphaned)
+            }
         })
         .flat_map(|block| {
             block
@@ -8168,8 +8636,6 @@ fn rebuild_dashboard_transactions(state: &mut AppState) {
                 .rev()
                 .map(|(position, summary)| (&block.summary.hash, position, &summary.txid))
         })
-        .filter(|(_, _, txid)| seen.insert(*txid))
-        .take(DASHBOARD_TRANSACTION_COUNT)
         .map(|(block, position, txid)| DashboardTransaction {
             block: block.clone(),
             position,
@@ -8177,11 +8643,11 @@ fn rebuild_dashboard_transactions(state: &mut AppState) {
         })
         .collect();
     dashboard.selected_transaction = selected
-        .and_then(|txid| {
+        .and_then(|(block, txid)| {
             dashboard
                 .recent_transactions
                 .iter()
-                .position(|entry| entry.txid == txid)
+                .position(|entry| entry.txid == txid && entry.block == block)
         })
         .unwrap_or(0);
 }
@@ -8304,6 +8770,21 @@ fn transaction_refresh_target(state: &AppState) -> Option<(Txid, BlockHash)> {
                     .and_then(|height| state.store.block_hash_at_height(height))
             }
         })?;
+    if let Some(record) = state.store.transaction(txid)
+        && record.raw_json["decodedBy"] == "ZMQ"
+        && record.raw_json["vout"].as_array().is_some_and(|outputs| {
+            outputs
+                .iter()
+                .all(|output| output["scriptPubKey"]["type"] != "nonstandard")
+        })
+        && (record
+            .block_hash
+            .as_deref()
+            .is_some_and(|hash| state.store.chain.confirmations(hash).is_some())
+            || state.store.chain.in_mempool(txid))
+    {
+        return None;
+    }
     if state.transaction_verified_tip.get(txid) == Some(tip) {
         return None;
     }
@@ -10107,6 +10588,17 @@ fn open_selected_mempool_transaction(
     else {
         return;
     };
+    if !state.store.contains_transaction(&txid)
+        && let Some(raw) = state
+            .mempool
+            .previews
+            .get(&txid)
+            .and_then(|preview| preview.raw.clone())
+    {
+        let mut record = transaction_record(&txid, raw);
+        record.source_id = Some(config.daemon_cache_key());
+        state.store.replace_transaction(record);
+    }
     push_screen(state, transaction_screen(txid.clone()));
     if state.store.contains_transaction(&txid) {
         request_transaction_context(state, config, tx, &txid);
@@ -10677,6 +11169,12 @@ fn request_clipboard_copy(
         return;
     }
     state.clipboard_busy = true;
+    if label == source_ui::zmq_setup::CLIPBOARD_LABEL {
+        state.zmq_copy_feedback = Some((
+            source_ui::zmq_setup::CopyStatus::Copying,
+            Instant::now() + Duration::from_secs(8),
+        ));
+    }
     state.notice = Some(TransientNotice {
         message: format!("Sending {label} to the terminal clipboard..."),
         until: Instant::now() + Duration::from_secs(8),
@@ -11448,7 +11946,7 @@ fn help_lines(theme: &Theme, state: &AppState, cache_path: &std::path::Path) -> 
             "Sources and links",
             &[
                 "F1 or ? opens Help. F5 refreshes the current view wherever manual refresh is available.",
-                "F2 sources: choose current chain, enable endpoints, monitor daemons, save states | F3 relationships | F4 witnesses | F7 inclusions/branches | F8 DeFi trail | F9 charts | F10 estimate",
+                "F2 sources: choose current chain, enable endpoints, monitor daemons, save states, z ZMQ setup | F3 relationships | F4 witnesses | F7 inclusions/branches | F8 DeFi trail | F9 charts | F10 estimate",
             ],
         ),
         (
@@ -12513,7 +13011,7 @@ fn control_help(screen: &Screen) -> &'static str {
             "Tab switch lists | j/k select | Home/End first/last | PgUp/PgDn page | Enter open | F5 refresh"
         }
         Screen::Mempool => {
-            "j/k select transaction | Home/End first/last | PgUp/PgDn page | Enter opens"
+            "j/k select transaction | Home/End first/last | PgUp/PgDn page | Enter opens | F5 refresh"
         }
         Screen::Marketplace => {
             "j/k select offer, a/Shift-A association next/prev, s/Shift-S sort next/prev, r reverse order, Enter opens, F5 refreshes"
@@ -12715,8 +13213,20 @@ fn render_dashboard(
         .constraints([Constraint::Length(5), Constraint::Min(3)])
         .split(area);
 
+    let control = &config.daemon.control;
+    let update_mode = if control.state() == crate::sources::ConnectionState::Disabled {
+        Span::styled("Daemon disabled", theme.muted())
+    } else if control.zmq.chain_signal().connected {
+        Span::styled("Listening on ZMQ for blocks", theme.positive())
+    } else {
+        Span::styled("RPC polling", theme.muted())
+    };
     let summary = Paragraph::new(vec![
-        Line::from(vec![Span::styled("Dashboard", theme.focused())]),
+        Line::from(vec![
+            Span::styled("Dashboard", theme.focused()),
+            Span::raw("  ·  "),
+            update_mode,
+        ]),
         Line::from(vec![
             Span::styled("Start object: ", theme.muted()),
             Span::styled(state.route_label.clone(), theme.focused()),
@@ -12771,7 +13281,7 @@ fn render_mempool(
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(3)])
         .split(area);
-    let refresh = if state.mempool.loading {
+    let refresh = if state.mempool.loading_since.is_some() {
         "refreshing".to_string()
     } else {
         state
@@ -12806,8 +13316,18 @@ fn render_mempool(
         Line::from(vec![
             Span::styled("Last block ", theme.muted()),
             Span::raw(last_block),
-            Span::styled("  Refresh ", theme.muted()),
-            Span::raw(format!("2s, {refresh}")),
+            Span::raw("  ·  "),
+            if config.daemon.control.state() == crate::sources::ConnectionState::Disabled {
+                Span::styled("Daemon disabled", theme.muted())
+            } else if config.daemon.control.zmq.mempool_connected() {
+                Span::styled("Listening on ZMQ", theme.positive())
+            } else {
+                Span::styled(
+                    format!("RPC polling every {MEMPOOL_REFRESH_SECONDS}s"),
+                    theme.muted(),
+                )
+            },
+            Span::raw(format!(" · {refresh}")),
         ]),
     ];
     if let Some(error) = &state.mempool.error {
@@ -12824,13 +13344,14 @@ fn render_mempool(
     );
 
     if state.mempool.entries.is_empty() {
-        let message = if state.mempool.loading && state.mempool.last_refresh.is_none() {
-            "Loading mempool..."
-        } else if state.mempool.error.is_some() {
-            "Mempool data is unavailable."
-        } else {
-            "Mempool is empty."
-        };
+        let message =
+            if state.mempool.loading_since.is_some() && state.mempool.last_refresh.is_none() {
+                "Loading mempool..."
+            } else if state.mempool.error.is_some() {
+                "Mempool data is unavailable."
+            } else {
+                "Mempool is empty."
+            };
         frame.render_widget(
             Paragraph::new(message)
                 .style(theme.muted())
@@ -13177,6 +13698,19 @@ fn marketplace_link_label(link: &MarketplaceLink, store: &ObjectStore) -> String
     }
 }
 
+fn mempool_visible_range(mempool: &MempoolState, list_height: u16) -> Range<usize> {
+    let count = mempool.entries.len();
+    let visible =
+        usize::from(list_height.saturating_sub(SECTION_HEADING_HEIGHT) / MEMPOOL_TILE_HEIGHT)
+            .max(1)
+            .min(count);
+    let first = mempool
+        .selected
+        .saturating_sub(visible / 2)
+        .min(count - visible);
+    first..first + visible
+}
+
 fn render_mempool_tiles(
     frame: &mut Frame<'_>,
     config: &Config,
@@ -13186,17 +13720,10 @@ fn render_mempool_tiles(
     area: Rect,
 ) {
     let count = state.mempool.entries.len();
-    let visible =
-        usize::from(area.height.saturating_sub(SECTION_HEADING_HEIGHT) / MEMPOOL_TILE_HEIGHT)
-            .max(1)
-            .min(count);
-    let max_first = count.saturating_sub(visible);
-    let first = state
-        .mempool
-        .selected
-        .saturating_sub(visible / 2)
-        .min(max_first);
-    let last = (first + visible).min(count);
+    let range = mempool_visible_range(&state.mempool, area.height);
+    let first = range.start;
+    let last = range.end;
+    let visible = range.len();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Transactions ", theme.focused()),
@@ -13270,6 +13797,30 @@ fn render_mempool_tile(
         count => format!("{count} unconfirmed parents"),
     };
     let width = tile_content_area(area).width;
+    let arrival_width = Line::from(arrival.as_str()).width();
+    let width_columns = usize::from(width);
+    let hash_with_arrival = width_columns.saturating_sub(arrival_width + 2);
+    let show_arrival = hash_with_arrival >= 5;
+    let hash_width = if show_arrival {
+        hash_with_arrival
+    } else {
+        width_columns
+    };
+    let txid = theme.value_as(
+        "transaction ID",
+        truncate_middle(&entry.txid, hash_width),
+        entry.txid.as_str(),
+        Style::default(),
+    );
+    let transaction_line = if show_arrival {
+        justified_line(
+            vec![txid],
+            vec![theme.value("arrival", arrival, Style::default())],
+            width,
+        )
+    } else {
+        Line::from(txid)
+    };
     let summary = store
         .transaction(&entry.txid)
         .map(|transaction| &transaction.summary)
@@ -13302,16 +13853,7 @@ fn render_mempool_tile(
             title: None,
             selected,
             lines: vec![
-                justified_line(
-                    vec![theme.value_as(
-                        "transaction ID",
-                        short_id(&entry.txid),
-                        entry.txid.as_str(),
-                        Style::default(),
-                    )],
-                    vec![theme.value("arrival", arrival, Style::default())],
-                    width,
-                ),
+                transaction_line,
                 justified_line(
                     vec![theme.value("fee", fee, Style::default())],
                     vec![theme.value("size", format_data_size(entry.size), Style::default())],
@@ -18683,6 +19225,11 @@ fn header_line(
         "api off"
     };
     let rpc = if tip.healthy { "rpc on" } else { "rpc off" };
+    let control = &config.daemon.control;
+    let zmq = control.zmq.header_status(
+        control.state() != crate::sources::ConnectionState::Disabled,
+        control.polling(),
+    );
     let peers = tip
         .connections
         .map(|connections| connections.to_string())
@@ -18703,7 +19250,7 @@ fn header_line(
     for name in [APP_TITLE, "Carbide"] {
         for status in [&full, &compact, &minimal] {
             let line = Line::from(format!(
-                " {icon} {name} | {chain} | {status} | {rpc} | {api} | peers {peers} "
+                " {icon} {name} | {chain} | {status} | {rpc} | {api} | {zmq} | peers {peers} "
             ));
             if line.width() <= usize::from(width) {
                 return line;
@@ -18712,6 +19259,8 @@ fn header_line(
     }
     // At very small widths remove other whole fields before clipping the height.
     for text in [
+        format!("{icon} Carbide | {chain} | {minimal} | {rpc} | {api} | {zmq}"),
+        format!("{icon} Carbide | {chain} | tip {height} | {rpc} | {api} | {zmq}"),
         format!("{icon} Carbide | {chain} | {compact} | {rpc}"),
         format!("{icon} Carbide | {chain} | {minimal}"),
         format!("{chain} | {minimal} | {rpc}"),
@@ -19018,17 +19567,19 @@ mod tests {
         let mut state = regression_state();
         let control = Arc::new(crate::sources::Control::default());
         let generation = control.generation();
-        state.mempool.loading = true;
+        let started = Instant::now();
+        state.mempool.loading_since = Some(started);
         let event = AppEvent::Guarded {
             control: control.clone(),
             generation,
-            event: Box::new(AppEvent::MempoolRefresh(Ok(parse_mempool_snapshot(
-                std::collections::HashMap::new(),
-            )))),
+            event: Box::new(AppEvent::MempoolRefresh {
+                started,
+                result: Ok(parse_mempool_snapshot(HashMap::new())),
+            }),
         };
         control.set(crate::sources::ConnectionState::Disabled);
         handle_app_event(&mut state, event);
-        assert!(!state.mempool.loading);
+        assert!(state.mempool.loading_since.is_none());
         assert!(state.mempool.last_refresh.is_none());
         state.store.chain.observe(RpcObservation {
             authorization: Some((control, generation, 0)),
@@ -19858,6 +20409,7 @@ mod tests {
             unmask_identity_addresses: false,
             notice: None,
             clipboard_busy: false,
+            zmq_copy_feedback: None,
             save_prompt: None,
             cache_clear_prompt: None,
             cache_size_bytes: Some(0),
@@ -20060,6 +20612,62 @@ mod tests {
     }
 
     #[test]
+    fn discarded_mempool_response_reschedules_only_its_own_request() {
+        let mut state = regression_state();
+        let started = Instant::now();
+        let control = Arc::new(crate::sources::Control::default());
+        control
+            .branch_epoch
+            .store(1, std::sync::atomic::Ordering::Release);
+        let response = || AppEvent::RevisionGuarded {
+            epoch: 0,
+            generation: control.generation(),
+            control: control.clone(),
+            event: Box::new(AppEvent::MempoolRefresh {
+                started,
+                result: Ok(parse_mempool_snapshot(HashMap::new())),
+            }),
+        };
+        state.mempool.loading_since = Some(started);
+        handle_app_event(&mut state, response());
+        assert!(state.mempool.loading_since.is_none());
+        assert!(state.mempool.needs_refresh);
+        assert!(state.mempool.last_refresh.is_none());
+
+        let newer = started + Duration::from_millis(1);
+        state.mempool.loading_since = Some(newer);
+        state.mempool.needs_refresh = false;
+        handle_app_event(&mut state, response());
+        assert_eq!(state.mempool.loading_since, Some(newer));
+        assert!(!state.mempool.needs_refresh);
+    }
+
+    #[test]
+    fn mempool_with_zmq_refreshes_on_events_without_a_periodic_rpc_timer() {
+        let mut mempool = MempoolState {
+            last_refresh: Some(Instant::now() - Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let mut hint = crate::zmq::Signal {
+            version: 0,
+            connected: true,
+            ready: true,
+        };
+        assert!(!mempool.refresh_due(hint, false, 2));
+        mempool.error = Some("Temporary RPC error".into());
+        assert!(!mempool.refresh_due(hint, false, 2));
+        assert!(mempool.refresh_due(hint, true, 2));
+        mempool.needs_refresh = true;
+        assert!(mempool.refresh_due(hint, false, 2));
+        mempool.needs_refresh = false;
+        hint.version += 1;
+        assert!(mempool.refresh_due(hint, false, 2));
+        mempool.zmq_seen = hint.version;
+        hint.connected = false;
+        assert!(mempool.refresh_due(hint, false, 2));
+    }
+
+    #[test]
     fn regression_header_fits_without_partial_fields() {
         let config = regression_config();
         let theme = Theme::desert(config.emoji);
@@ -20075,6 +20683,7 @@ mod tests {
             |width| header_line(&config, &config.chain.name, &theme, &tip, 1180, width).to_string();
         assert!(text(110).contains("Verus Carbide | VRSC"));
         assert!(text(110).contains("4222000/4222003 (Δ3)"));
+        assert!(text(110).contains("rpc on | api off | zmq off"));
         assert!(text(65).contains("Carbide | VRSC"));
         assert!(text(65).contains("tip 4222000"));
         assert!(!text(65).contains('/'));
@@ -20392,6 +21001,7 @@ mod tests {
             unmask_identity_addresses: false,
             notice: None,
             clipboard_busy: false,
+            zmq_copy_feedback: None,
             save_prompt: None,
             cache_clear_prompt: None,
             cache_size_bytes: Some(0),
@@ -21947,6 +22557,7 @@ mod tests {
             unmask_identity_addresses: false,
             notice: None,
             clipboard_busy: false,
+            zmq_copy_feedback: None,
             save_prompt: None,
             cache_clear_prompt: None,
             cache_size_bytes: Some(0),
